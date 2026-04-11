@@ -8,8 +8,8 @@ export default defineConfig({
     VitePWA({
       registerType: 'autoUpdate',
       manifest: {
-        name: 'HydroKids',
-        short_name: 'HydroKids',
+        name: 'The Daily Drink',
+short_name: 'Daily Drink',
         description: 'Keep your pet happy - stay hydrated!',
         theme_color: '#16213e',
         background_color: '#16213e',
