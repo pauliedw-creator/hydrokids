@@ -11,7 +11,7 @@ async function syncLog(userId, date, totalMl) {
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify({ userId, date, totalMl }),
     });
-  } catch(e) { console.warn("syncLog failed:", e); }
+  } catch(e) { console.warn("syncLog:", e); }
 }
 
 async function syncAll(logs) {
@@ -22,7 +22,7 @@ async function syncAll(logs) {
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify({ logs }),
     });
-  } catch(e) { console.warn("syncAll failed:", e); }
+  } catch(e) { console.warn("syncAll:", e); }
 }
 
 async function syncProfile(user) {
@@ -31,50 +31,142 @@ async function syncProfile(user) {
     await fetch(APPS_SCRIPT_URL + "?action=profile", {
       method:"POST", mode:"no-cors",
       headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({
-        userId:       user.id,
-        name:         user.name,
-        goal:         user.goal,
-        animal:       user.animal,
-        themeId:      user.themeId,
-        animalColorId:user.animalColorId,
-      }),
+      body:JSON.stringify({ userId:user.id, name:user.name, goal:user.goal, animal:user.animal, themeId:user.themeId, animalColorId:user.animalColorId }),
     });
-  } catch(e) { console.warn("syncProfile failed:", e); }
+  } catch(e) { console.warn("syncProfile:", e); }
 }
 
-async function fetchAndMergeLogs(localLogs) {
-  if (!APPS_SCRIPT_URL) return localLogs;
+async function fetchAndMergeLogs(local) {
+  if (!APPS_SCRIPT_URL) return local;
   try {
-    const res  = await fetch(APPS_SCRIPT_URL + "?action=fetch");
-    const json = await res.json();
-    if (json.status !== "ok") return localLogs;
-    return { ...localLogs, ...json.data.logs };
-  } catch(e) { return localLogs; }
+    const res = await fetch(APPS_SCRIPT_URL + "?action=fetch");
+    const j   = await res.json();
+    if (j.status !== "ok") return local;
+    return { ...local, ...j.data.logs };
+  } catch(e) { return local; }
 }
 
-// Fetch profiles from Sheets and merge into local users array.
-// Remote wins on every field — it's the source of truth for settings.
 async function fetchAndMergeProfiles(localUsers) {
   if (!APPS_SCRIPT_URL) return localUsers;
   try {
-    const res  = await fetch(APPS_SCRIPT_URL + "?action=profiles");
-    const json = await res.json();
-    if (json.status !== "ok") return localUsers;
-    const remoteProfiles = json.data.profiles; // array of profile objects
+    const res = await fetch(APPS_SCRIPT_URL + "?action=profiles");
+    const j   = await res.json();
+    if (j.status !== "ok") return localUsers;
     return localUsers.map(u => {
-      const remote = remoteProfiles.find(p => p.userId === u.id);
-      if (!remote) return u;
-      return {
-        ...u,
-        name:         remote.name         || u.name,
-        goal:         remote.goal         || u.goal,
-        animal:       remote.animal       || u.animal,
-        themeId:      remote.themeId      || u.themeId,
-        animalColorId:remote.animalColorId|| u.animalColorId,
-      };
+      const r = j.data.profiles.find(p => p.userId === u.id);
+      if (!r) return u;
+      return { ...u, name:r.name||u.name, goal:r.goal||u.goal, animal:r.animal||u.animal, themeId:r.themeId||u.themeId, animalColorId:r.animalColorId||u.animalColorId };
     });
   } catch(e) { return localUsers; }
+}
+
+// ── Sound effects ─────────────────────────────────────────────────────────────
+function playSound(type) {
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    const ctx = new AC();
+
+    const note = (freq, start, dur, vol=0.3, wave="sine") => {
+      const osc = ctx.createOscillator();
+      const g   = ctx.createGain();
+      osc.connect(g); g.connect(ctx.destination);
+      osc.type = wave;
+      osc.frequency.value = freq;
+      g.gain.setValueAtTime(vol, ctx.currentTime + start);
+      g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + start + dur);
+      osc.start(ctx.currentTime + start);
+      osc.stop(ctx.currentTime + start + dur + 0.02);
+    };
+
+    if (type === "splash") {
+      note(700, 0,    0.12, 0.35, "sine");
+      note(500, 0,    0.15, 0.2,  "sine");
+      note(950, 0.05, 0.1,  0.15, "sine");
+    } else if (type === "fanfare") {
+      [[523, 0],[659, 0.11],[784, 0.22],[1047, 0.33]].forEach(([f,t]) => note(f, t, 0.28, 0.28, "triangle"));
+    } else if (type === "badge") {
+      [[440,0],[554,0.08],[659,0.16],[880,0.24]].forEach(([f,t]) => note(f, t, 0.22, 0.2, "sine"));
+    }
+  } catch(e) { /* sound not supported */ }
+}
+
+// ── Badges ────────────────────────────────────────────────────────────────────
+const BADGES = [
+  { id:"first_drink",    emoji:"💧", label:"First Sip",      desc:"Log your very first drink"      },
+  { id:"first_goal",     emoji:"🎯", label:"Goal Getter",    desc:"Hit your daily goal for the first time" },
+  { id:"streak_3",       emoji:"🔥", label:"On Fire",        desc:"3 day streak"                   },
+  { id:"streak_7",       emoji:"⚡", label:"Week Warrior",   desc:"7 day streak"                   },
+  { id:"streak_30",      emoji:"🏆", label:"Monthly Master", desc:"30 day streak"                  },
+  { id:"century",        emoji:"💯", label:"Century Club",   desc:"Log 100 drinks total"           },
+  { id:"perfect_week",   emoji:"🌊", label:"Perfect Week",   desc:"Hit goal every day for 7 days"  },
+  { id:"super_hydrated", emoji:"⭐", label:"Super Hydrated", desc:"Exceed your goal by 20% in a day"},
+];
+
+function computeStats(userId, goal, logs) {
+  const t = today();
+  let streak = 0, goalsHit = 0, perfectWeek = true;
+  for (let i = 0; i < 60; i++) {
+    const d = new Date(); d.setDate(d.getDate() - i);
+    const key = `${userId}-${d.toISOString().split("T")[0]}`;
+    const val = logs[key] || 0;
+    if (val >= goal) { streak++; goalsHit++; }
+    else if (i > 0) { if (i < 7) perfectWeek = false; break; }
+    if (i === 0 && val < goal) perfectWeek = false;
+    if (i < 7 && val < goal) perfectWeek = false;
+  }
+  const todayVal  = logs[`${userId}-${t}`] || 0;
+  const exceededGoal = todayVal >= goal * 1.2;
+  return { streak, goalsHit, perfectWeek, exceededGoal };
+}
+
+function checkBadges(userId, goal, logs) {
+  const stats     = computeStats(userId, goal, logs);
+  const dcount    = parseInt(localStorage.getItem(`tdd_dcount_${userId}`) || "0");
+  stats.totalDrinks = dcount;
+  const saved     = JSON.parse(localStorage.getItem(`tdd_badges_${userId}`) || "{}");
+  const newOnes   = [];
+
+  const checks = {
+    first_drink:    () => stats.totalDrinks >= 1,
+    first_goal:     () => stats.goalsHit >= 1,
+    streak_3:       () => stats.streak >= 3,
+    streak_7:       () => stats.streak >= 7,
+    streak_30:      () => stats.streak >= 30,
+    century:        () => stats.totalDrinks >= 100,
+    perfect_week:   () => stats.perfectWeek,
+    super_hydrated: () => stats.exceededGoal,
+  };
+
+  BADGES.forEach(b => {
+    if (!saved[b.id] && checks[b.id]?.()) {
+      saved[b.id] = new Date().toISOString();
+      newOnes.push(b);
+    }
+  });
+
+  if (newOnes.length) localStorage.setItem(`tdd_badges_${userId}`, JSON.stringify(saved));
+  return { saved, newOnes };
+}
+
+function getBadges(userId) {
+  return JSON.parse(localStorage.getItem(`tdd_badges_${userId}`) || "{}");
+}
+
+// ── Seasonal theme ────────────────────────────────────────────────────────────
+function getSeasonalTheme() {
+  const m = new Date().getMonth() + 1, d = new Date().getDate();
+  if ((m === 12 && d >= 1) || (m === 1 && d <= 6))
+    return { label:"🎄 Christmas!", emojis:["🎄","⛄","❄️","🎅","🌟"], bg:["#0d1f0d","#0d1a0d","#1a2e1a"] };
+  if (m === 10 && d >= 25)
+    return { label:"🎃 Halloween!", emojis:["🎃","👻","🕷️","🦇","🌙"], bg:["#1a0d00","#2d1b00","#1a0020"] };
+  if (m >= 3 && m <= 5)
+    return { label:"🌸 Spring!",    emojis:["🌸","🌺","🦋","🌼","🌱"], bg:["#0d1e2e","#1a1032","#0d2211"] };
+  if (m >= 6 && m <= 8)
+    return { label:"☀️ Summer!",    emojis:["☀️","🌊","🏖️","🌺","🍉"], bg:["#001a2e","#0d1e2e","#001a10"] };
+  if (m >= 9 && m <= 11)
+    return { label:"🍂 Autumn!",    emojis:["🍂","🍁","🌰","🍄","🦔"], bg:["#2e1a0d","#1a0d00","#2a1800"] };
+  return   { label:"❄️ Winter!",    emojis:["❄️","⛄","🌨️","✨","💙"], bg:["#0d1a2e","#0d0d1a","#001a2e"] };
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -149,9 +241,7 @@ function CatFace({ pct, color, size=118 }) {
       :<><ellipse cx={cx-s*.14} cy={cy-s*.01} rx={s*.07} ry={s*.075} fill="#333"/><ellipse cx={cx+s*.14} cy={cy-s*.01} rx={s*.07} ry={s*.075} fill="#333"/><circle cx={cx-s*.11} cy={cy-s*.04} r={s*.025} fill="white"/><circle cx={cx+s*.17} cy={cy-s*.04} r={s*.025} fill="white"/></>}
       <ellipse cx={cx} cy={cy+s*.1} rx={s*.04} ry={s*.03} fill="#FFAAB5"/>
       <line x1={cx} y1={cy+s*.13} x2={cx} y2={cy+s*.16} stroke="#FFAAB5" strokeWidth="1.5"/>
-      {sad?<path d={`M${cx-s*.1} ${cy+s*.22} Q${cx} ${cy+s*.17} ${cx+s*.1} ${cy+s*.22}`} stroke="#555" strokeWidth="2" fill="none" strokeLinecap="round"/>
-      :happy?<path d={`M${cx-s*.1} ${cy+s*.16} Q${cx} ${cy+s*.25} ${cx+s*.1} ${cy+s*.16}`} stroke="#555" strokeWidth="2" fill="none" strokeLinecap="round"/>
-      :<path d={`M${cx-s*.07} ${cy+s*.18} Q${cx} ${cy+s*.21} ${cx+s*.07} ${cy+s*.18}`} stroke="#555" strokeWidth="1.8" fill="none" strokeLinecap="round"/>}
+      {sad?<path d={`M${cx-s*.1} ${cy+s*.22} Q${cx} ${cy+s*.17} ${cx+s*.1} ${cy+s*.22}`} stroke="#555" strokeWidth="2" fill="none" strokeLinecap="round"/>:happy?<path d={`M${cx-s*.1} ${cy+s*.16} Q${cx} ${cy+s*.25} ${cx+s*.1} ${cy+s*.16}`} stroke="#555" strokeWidth="2" fill="none" strokeLinecap="round"/>:<path d={`M${cx-s*.07} ${cy+s*.18} Q${cx} ${cy+s*.21} ${cx+s*.07} ${cy+s*.18}`} stroke="#555" strokeWidth="1.8" fill="none" strokeLinecap="round"/>}
       {[[-1,-.06],[-1,.03],[1,-.06],[1,.03]].map(([dir,dy],i)=>(<line key={i} x1={cx+dir*(s*.06)} y1={cy+s*dy+s*.11} x2={cx+dir*(s*.38)} y2={cy+s*dy+s*.09+(dir===-1?-s*.015:s*.015)} stroke="#aaa" strokeWidth="1.2" strokeLinecap="round" opacity=".6"/>))}
       {(happy||okay)&&<><ellipse cx={cx-s*.27} cy={cy+s*.06} rx={s*.07} ry={s*.04} fill="#FFB3C1" opacity={happy?.5:.25}/><ellipse cx={cx+s*.27} cy={cy+s*.06} rx={s*.07} ry={s*.04} fill="#FFB3C1" opacity={happy?.5:.25}/></>}
       {happy&&<><text x={cx-s*.48} y={cy-s*.3} fontSize={s*.18}>✨</text><text x={cx+s*.32} y={cy-s*.32} fontSize={s*.16}>💧</text></>}
@@ -175,9 +265,7 @@ function DogFace({ pct, color, size=118 }) {
       {sad?[cx-s*.15,cx+s*.15].map((ex,i)=>(<g key={i}><line x1={ex-s*.06} y1={cy-s*.08} x2={ex+s*.06} y2={cy-s*.01} stroke="#444" strokeWidth="2.5" strokeLinecap="round"/><line x1={ex+s*.06} y1={cy-s*.08} x2={ex-s*.06} y2={cy-s*.01} stroke="#444" strokeWidth="2.5" strokeLinecap="round"/></g>))
       :happy?<><path d={`M${cx-s*.2} ${cy-s*.06} Q${cx-s*.13} ${cy-s*.14} ${cx-s*.06} ${cy-s*.06}`} stroke="#333" strokeWidth="2.5" fill="none" strokeLinecap="round"/><path d={`M${cx+s*.06} ${cy-s*.06} Q${cx+s*.13} ${cy-s*.14} ${cx+s*.2} ${cy-s*.06}`} stroke="#333" strokeWidth="2.5" fill="none" strokeLinecap="round"/></>
       :<><ellipse cx={cx-s*.15} cy={cy-s*.07} rx={s*.065} ry={s*.07} fill="#333"/><ellipse cx={cx+s*.15} cy={cy-s*.07} rx={s*.065} ry={s*.07} fill="#333"/><circle cx={cx-s*.12} cy={cy-s*.1} r={s*.022} fill="white"/><circle cx={cx+s*.18} cy={cy-s*.1} r={s*.022} fill="white"/></>}
-      {sad?<path d={`M${cx-s*.1} ${cy+s*.24} Q${cx} ${cy+s*.2} ${cx+s*.1} ${cy+s*.24}`} stroke="#888" strokeWidth="2" fill="none" strokeLinecap="round"/>
-      :happy?<><path d={`M${cx-s*.1} ${cy+s*.18} Q${cx} ${cy+s*.27} ${cx+s*.1} ${cy+s*.18}`} stroke="#E07070" strokeWidth="2.5" fill="none" strokeLinecap="round"/><ellipse cx={cx} cy={cy+s*.22} rx={s*.07} ry={s*.04} fill="#FF9090" opacity=".5"/></>
-      :<path d={`M${cx-s*.08} ${cy+s*.2} Q${cx} ${cy+s*.24} ${cx+s*.08} ${cy+s*.2}`} stroke="#888" strokeWidth="1.8" fill="none" strokeLinecap="round"/>}
+      {sad?<path d={`M${cx-s*.1} ${cy+s*.24} Q${cx} ${cy+s*.2} ${cx+s*.1} ${cy+s*.24}`} stroke="#888" strokeWidth="2" fill="none" strokeLinecap="round"/>:happy?<><path d={`M${cx-s*.1} ${cy+s*.18} Q${cx} ${cy+s*.27} ${cx+s*.1} ${cy+s*.18}`} stroke="#E07070" strokeWidth="2.5" fill="none" strokeLinecap="round"/><ellipse cx={cx} cy={cy+s*.22} rx={s*.07} ry={s*.04} fill="#FF9090" opacity=".5"/></>:<path d={`M${cx-s*.08} ${cy+s*.2} Q${cx} ${cy+s*.24} ${cx+s*.08} ${cy+s*.2}`} stroke="#888" strokeWidth="1.8" fill="none" strokeLinecap="round"/>}
       {(happy||okay)&&<><ellipse cx={cx-s*.3} cy={cy+s*.04} rx={s*.07} ry={s*.04} fill="#FFB3C1" opacity={happy?.5:.2}/><ellipse cx={cx+s*.3} cy={cy+s*.04} rx={s*.07} ry={s*.04} fill="#FFB3C1" opacity={happy?.5:.2}/></>}
       {happy&&<text x={cx-s*.08} y={cy-s*.42} fontSize={s*.22}>😛</text>}
       {sad&&<text x={cx-s*.05} y={cy+s*.54} fontSize={s*.16}>😢</text>}
@@ -197,12 +285,8 @@ function FishFace({ pct, color, size=118 }) {
       <ellipse cx={cx-s*.06} cy={cy+s*.06} rx={s*.26} ry={s*.16} fill="white" opacity=".35"/>
       <path d={`M${cx-s*.1} ${cy-s*.28} Q${cx+s*.06} ${cy-s*.44} ${cx+s*.14} ${cy-s*.18}`} fill={color} opacity=".8"/>
       <circle cx={cx-s*.22} cy={cy-s*.06} r={s*.1} fill="white"/>
-      {sad?<><line x1={cx-s*.28} y1={cy-s*.1} x2={cx-s*.16} y2={cy-s*.02} stroke="#444" strokeWidth="2" strokeLinecap="round"/><line x1={cx-s*.16} y1={cy-s*.1} x2={cx-s*.28} y2={cy-s*.02} stroke="#444" strokeWidth="2" strokeLinecap="round"/></>
-      :happy?<path d={`M${cx-s*.3} ${cy-s*.06} Q${cx-s*.22} ${cy-s*.16} ${cx-s*.14} ${cy-s*.06}`} stroke="#333" strokeWidth="2.2" fill="none" strokeLinecap="round"/>
-      :<><ellipse cx={cx-s*.22} cy={cy-s*.06} rx={s*.055} ry={s*.065} fill="#222"/><circle cx={cx-s*.2} cy={cy-s*.09} r={s*.02} fill="white"/></>}
-      {sad?<path d={`M${cx-s*.38} ${cy+s*.1} Q${cx-s*.34} ${cy+s*.06} ${cx-s*.3} ${cy+s*.1}`} stroke="#888" strokeWidth="1.8" fill="none" strokeLinecap="round"/>
-      :happy?<path d={`M${cx-s*.38} ${cy+s*.06} Q${cx-s*.34} ${cy+s*.13} ${cx-s*.3} ${cy+s*.06}`} stroke="#555" strokeWidth="1.8" fill="none" strokeLinecap="round"/>
-      :<circle cx={cx-s*.34} cy={cy+s*.08} r={s*.025} fill="#888"/>}
+      {sad?<><line x1={cx-s*.28} y1={cy-s*.1} x2={cx-s*.16} y2={cy-s*.02} stroke="#444" strokeWidth="2" strokeLinecap="round"/><line x1={cx-s*.16} y1={cy-s*.1} x2={cx-s*.28} y2={cy-s*.02} stroke="#444" strokeWidth="2" strokeLinecap="round"/></>:happy?<path d={`M${cx-s*.3} ${cy-s*.06} Q${cx-s*.22} ${cy-s*.16} ${cx-s*.14} ${cy-s*.06}`} stroke="#333" strokeWidth="2.2" fill="none" strokeLinecap="round"/>:<><ellipse cx={cx-s*.22} cy={cy-s*.06} rx={s*.055} ry={s*.065} fill="#222"/><circle cx={cx-s*.2} cy={cy-s*.09} r={s*.02} fill="white"/></>}
+      {sad?<path d={`M${cx-s*.38} ${cy+s*.1} Q${cx-s*.34} ${cy+s*.06} ${cx-s*.3} ${cy+s*.1}`} stroke="#888" strokeWidth="1.8" fill="none" strokeLinecap="round"/>:happy?<path d={`M${cx-s*.38} ${cy+s*.06} Q${cx-s*.34} ${cy+s*.13} ${cx-s*.3} ${cy+s*.06}`} stroke="#555" strokeWidth="1.8" fill="none" strokeLinecap="round"/>:<circle cx={cx-s*.34} cy={cy+s*.08} r={s*.025} fill="#888"/>}
       {[[0,.08],[-.1,.02],[.1,.02],[-.05,-.08],[.05,-.08]].map(([dx,dy],i)=>(<ellipse key={i} cx={cx+dx*s} cy={cy+dy*s} rx={s*.06} ry={s*.04} fill="none" stroke="white" strokeWidth="1" opacity=".3"/>))}
       {bubbles.map((b,i)=><circle key={i} cx={b.x} cy={b.y} r={b.r} fill="none" stroke={color} strokeWidth="1.5" opacity=".7"/>)}
       {sad&&<text x={cx-s*.5} y={cy+s*.52} fontSize={s*.16}>💦</text>}
@@ -216,32 +300,22 @@ function UnicornFace({ pct, color, size=118 }) {
   return (
     <svg width={s} height={s} viewBox={`0 0 ${s} ${s}`} style={{overflow:"visible"}}>
       {happy&&<circle cx={cx} cy={cy+s*.05} r={s*.42} fill={color} opacity=".15"/>}
-      {/* Mane — behind head */}
       <ellipse cx={cx+s*.34} cy={cy-s*.18} rx={s*.1} ry={s*.2} fill="#C084FC" transform={`rotate(20,${cx+s*.34},${cy-s*.18})`}/>
       <ellipse cx={cx+s*.28} cy={cy-s*.24} rx={s*.09} ry={s*.18} fill="#F472B6" transform={`rotate(10,${cx+s*.28},${cy-s*.24})`}/>
-      <ellipse cx={cx+s*.22} cy={cy-s*.27} rx={s*.08} ry={s*.16} fill="#818CF8" transform={`rotate(0,${cx+s*.22},${cy-s*.27})`}/>
+      <ellipse cx={cx+s*.22} cy={cy-s*.27} rx={s*.08} ry={s*.16} fill="#818CF8"/>
       {happy&&<ellipse cx={cx+s*.15} cy={cy-s*.29} rx={s*.07} ry={s*.14} fill="#34D399" transform={`rotate(-8,${cx+s*.15},${cy-s*.29})`}/>}
-      {/* Horn */}
       <polygon points={`${cx},${cy-s*.52} ${cx-s*.06},${cy-s*.28} ${cx+s*.06},${cy-s*.28}`} fill="#FCD34D"/>
       <line x1={cx} y1={cy-s*.5} x2={cx-s*.02} y2={cy-s*.3} stroke="#F59E0B" strokeWidth="1.2" opacity=".55"/>
-      {/* Ear */}
       <polygon points={`${cx-s*.3},${cy-s*.22} ${cx-s*.38},${cy-s*.46} ${cx-s*.16},${cy-s*.3}`} fill={color}/>
       <polygon points={`${cx-s*.29},${cy-s*.24} ${cx-s*.35},${cy-s*.42} ${cx-s*.19},${cy-s*.31}`} fill="white" opacity=".45"/>
-      {/* Head */}
       <ellipse cx={cx} cy={cy+s*.04} rx={s*.35} ry={s*.32} fill={color}/>
-      {/* Snout */}
       <ellipse cx={cx} cy={cy+s*.18} rx={s*.19} ry={s*.13} fill="white" opacity=".5"/>
-      {/* Nose dots */}
       <circle cx={cx-s*.07} cy={cy+s*.19} r={s*.03} fill="#FDA4AF" opacity=".8"/>
       <circle cx={cx+s*.07} cy={cy+s*.19} r={s*.03} fill="#FDA4AF" opacity=".8"/>
-      {/* Eyes */}
       {sad?[cx-s*.14,cx+s*.14].map((ex,i)=>(<g key={i}><line x1={ex-s*.06} y1={cy-s*.04} x2={ex+s*.06} y2={cy+s*.03} stroke="#444" strokeWidth="2.4" strokeLinecap="round"/><line x1={ex+s*.06} y1={cy-s*.04} x2={ex-s*.06} y2={cy+s*.03} stroke="#444" strokeWidth="2.4" strokeLinecap="round"/></g>))
       :happy?<><path d={`M${cx-s*.22} ${cy} Q${cx-s*.14} ${cy-s*.1} ${cx-s*.06} ${cy}`} stroke="#333" strokeWidth="2.4" fill="none" strokeLinecap="round"/><path d={`M${cx+s*.06} ${cy} Q${cx+s*.14} ${cy-s*.1} ${cx+s*.22} ${cy}`} stroke="#333" strokeWidth="2.4" fill="none" strokeLinecap="round"/></>
       :<><ellipse cx={cx-s*.14} cy={cy-s*.01} rx={s*.07} ry={s*.075} fill="#333"/><ellipse cx={cx+s*.14} cy={cy-s*.01} rx={s*.07} ry={s*.075} fill="#333"/><circle cx={cx-s*.11} cy={cy-s*.04} r={s*.025} fill="white"/><circle cx={cx+s*.17} cy={cy-s*.04} r={s*.025} fill="white"/></>}
-      {/* Mouth */}
-      {sad?<path d={`M${cx-s*.1} ${cy+s*.27} Q${cx} ${cy+s*.22} ${cx+s*.1} ${cy+s*.27}`} stroke="#888" strokeWidth="1.8" fill="none" strokeLinecap="round"/>
-      :<path d={`M${cx-s*.1} ${cy+s*.22} Q${cx} ${cy+s*.3} ${cx+s*.1} ${cy+s*.22}`} stroke="#888" strokeWidth={happy?"2.2":"1.8"} fill="none" strokeLinecap="round"/>}
-      {/* Cheeks */}
+      {sad?<path d={`M${cx-s*.1} ${cy+s*.27} Q${cx} ${cy+s*.22} ${cx+s*.1} ${cy+s*.27}`} stroke="#888" strokeWidth="1.8" fill="none" strokeLinecap="round"/>:<path d={`M${cx-s*.1} ${cy+s*.22} Q${cx} ${cy+s*.3} ${cx+s*.1} ${cy+s*.22}`} stroke="#888" strokeWidth={happy?"2.2":"1.8"} fill="none" strokeLinecap="round"/>}
       {(happy||okay)&&<><ellipse cx={cx-s*.28} cy={cy+s*.1} rx={s*.07} ry={s*.04} fill="#FFB3C1" opacity={happy?.55:.25}/><ellipse cx={cx+s*.28} cy={cy+s*.1} rx={s*.07} ry={s*.04} fill="#FFB3C1" opacity={happy?.55:.25}/></>}
       {happy&&<><text x={cx-s*.52} y={cy-s*.28} fontSize={s*.18}>✨</text><text x={cx+s*.34} y={cy-s*.3} fontSize={s*.15}>🌈</text></>}
       {sad&&<text x={cx-s*.05} y={cy+s*.56} fontSize={s*.16}>😢</text>}
@@ -267,8 +341,7 @@ function RabbitFace({ pct, color, size=118 }) {
       {sad?[cx-s*.14,cx+s*.14].map((ex,i)=>(<g key={i}><line x1={ex-s*.06} y1={cy-s*.04} x2={ex+s*.06} y2={cy+s*.03} stroke="#444" strokeWidth="2.4" strokeLinecap="round"/><line x1={ex+s*.06} y1={cy-s*.04} x2={ex-s*.06} y2={cy+s*.03} stroke="#444" strokeWidth="2.4" strokeLinecap="round"/></g>))
       :happy?<><path d={`M${cx-s*.22} ${cy} Q${cx-s*.14} ${cy-s*.1} ${cx-s*.06} ${cy}`} stroke="#333" strokeWidth="2.4" fill="none" strokeLinecap="round"/><path d={`M${cx+s*.06} ${cy} Q${cx+s*.14} ${cy-s*.1} ${cx+s*.22} ${cy}`} stroke="#333" strokeWidth="2.4" fill="none" strokeLinecap="round"/></>
       :<><circle cx={cx-s*.14} cy={cy-s*.01} r={s*.07} fill="#555"/><circle cx={cx+s*.14} cy={cy-s*.01} r={s*.07} fill="#555"/><circle cx={cx-s*.11} cy={cy-s*.04} r={s*.024} fill="white"/><circle cx={cx+s*.17} cy={cy-s*.04} r={s*.024} fill="white"/></>}
-      {sad?<path d={`M${cx-s*.1} ${cy+s*.22} Q${cx} ${cy+s*.17} ${cx+s*.1} ${cy+s*.22}`} stroke="#888" strokeWidth="1.8" fill="none" strokeLinecap="round"/>
-      :<path d={`M${cx-s*.1} ${cy+s*.18} Q${cx} ${cy+s*.26} ${cx+s*.1} ${cy+s*.18}`} stroke="#888" strokeWidth={happy?"2.2":"1.8"} fill="none" strokeLinecap="round"/>}
+      {sad?<path d={`M${cx-s*.1} ${cy+s*.22} Q${cx} ${cy+s*.17} ${cx+s*.1} ${cy+s*.22}`} stroke="#888" strokeWidth="1.8" fill="none" strokeLinecap="round"/>:<path d={`M${cx-s*.1} ${cy+s*.18} Q${cx} ${cy+s*.26} ${cx+s*.1} ${cy+s*.18}`} stroke="#888" strokeWidth={happy?"2.2":"1.8"} fill="none" strokeLinecap="round"/>}
       {(happy||okay)&&<><ellipse cx={cx-s*.28} cy={cy+s*.1} rx={s*.07} ry={s*.04} fill="#FFB3C1" opacity={happy?.5:.25}/><ellipse cx={cx+s*.28} cy={cy+s*.1} rx={s*.07} ry={s*.04} fill="#FFB3C1" opacity={happy?.5:.25}/></>}
       {happy&&<><text x={cx-s*.52} y={cy-s*.28} fontSize={s*.18}>✨</text><text x={cx+s*.34} y={cy-s*.3} fontSize={s*.15}>🥕</text></>}
       {sad&&<text x={cx-s*.05} y={cy+s*.56} fontSize={s*.16}>😢</text>}
@@ -286,18 +359,129 @@ function AnimalFace({ animal, pct, color, size=118 }) {
   }
 }
 
-// ── UI helpers ────────────────────────────────────────────────────────────────
+// ── Water Tank ────────────────────────────────────────────────────────────────
+function WaterTank({ value, max, accentColor, animal, animalColor }) {
+  const pct = Math.min(value / max, 1);
+  const W=200, H=260, TX=12, TY=12, TW=176, TH=236, RX=28;
+  const maxH   = TH - 4;
+  const waterH = pct * maxH;
+  const wTopY  = TY + TH - waterH;
+  const botY   = TY + TH;
+  const animalSz = 86;
+  const animalTop = Math.max(TY + 2, wTopY - animalSz * 0.52);
+
+  // Wave paths — tile at period TW=176, covers TX to TX+2.5*TW for seamless scroll
+  const wp = (flip) => {
+    const amp = flip ? -10 : 10;
+    let d = `M${TX},${wTopY}`;
+    for (let i = 0; i <= 4; i++) {
+      const x1 = TX + i * TW, x2 = TX + (i + 0.5) * TW, x3 = TX + (i + 1) * TW;
+      d += ` Q${(x1+x2)/2},${wTopY - amp} ${x2},${wTopY} Q${(x2+x3)/2},${wTopY + amp} ${x3},${wTopY}`;
+    }
+    d += ` L${TX + 5*TW},${botY} L${TX},${botY} Z`;
+    return d;
+  };
+
+  return (
+    <div style={{ position:"relative", width:W, height:H, flexShrink:0 }}>
+      <svg width={W} height={H} style={{ position:"absolute", inset:0 }}>
+        <defs>
+          <clipPath id="tClip">
+            <rect x={TX} y={TY} width={TW} height={TH} rx={RX}/>
+          </clipPath>
+        </defs>
+
+        {/* Tank tint */}
+        <rect x={TX} y={TY} width={TW} height={TH} rx={RX} fill={accentColor} opacity={0.07}/>
+
+        {/* Solid water body */}
+        {waterH > 22 && (
+          <rect x={TX} y={wTopY + 20} width={TW} height={Math.max(0, waterH - 20)}
+            fill={accentColor} opacity={0.28} clipPath="url(#tClip)"/>
+        )}
+
+        {/* Wave 1 — moves left */}
+        {waterH > 0 && (
+          <g clipPath="url(#tClip)">
+            <path d={wp(false)} fill={accentColor} opacity={0.42}
+              style={{ animation:"tankWave1 3s linear infinite" }}/>
+          </g>
+        )}
+
+        {/* Wave 2 — moves right, inverted */}
+        {waterH > 0 && (
+          <g clipPath="url(#tClip)">
+            <path d={wp(true)} fill={accentColor} opacity={0.2}
+              style={{ animation:"tankWave2 4.5s linear infinite" }}/>
+          </g>
+        )}
+
+        {/* Bubbles */}
+        {pct > 0.08 && [
+          { cx:TX+TW*.22, delay:"0s",   dur:"2.8s" },
+          { cx:TX+TW*.58, delay:"1.1s", dur:"3.4s" },
+          { cx:TX+TW*.76, delay:"0.5s", dur:"2.4s" },
+        ].map((b,i) => (
+          <circle key={i} cx={b.cx} cy={wTopY + waterH * (0.3 + i * 0.15)} r={3 + i * 0.5}
+            fill={accentColor} opacity={0.35}
+            style={{ animation:`bubbleRise ${b.dur} ${b.delay} ease-in infinite` }}
+            clipPath="url(#tClip)"/>
+        ))}
+
+        {/* Measurement ticks */}
+        {[0.25, 0.5, 0.75].map(lv => {
+          const my = TY + TH - lv * maxH;
+          const on = pct >= lv;
+          return (
+            <g key={lv}>
+              <line x1={TX + TW * 0.72} y1={my} x2={TX + TW - 6} y2={my}
+                stroke={accentColor} strokeWidth={1.5} opacity={on ? 0.55 : 0.18}/>
+              <text x={TX + TW * 0.70} y={my + 4} fontSize={9} fill={accentColor}
+                textAnchor="end" fontFamily="Nunito,sans-serif" fontWeight="700"
+                opacity={on ? 0.65 : 0.2}>
+                {Math.round(lv * 100)}%
+              </text>
+            </g>
+          );
+        })}
+
+        {/* Tank border */}
+        <rect x={TX} y={TY} width={TW} height={TH} rx={RX}
+          fill="none" stroke={accentColor} strokeWidth={2.5} opacity={0.28}/>
+
+        {/* Rivets */}
+        {[[TX+13,TY+13],[TX+TW-13,TY+13],[TX+13,TY+TH-13],[TX+TW-13,TY+TH-13]].map(([bx,by],i)=>(
+          <circle key={i} cx={bx} cy={by} r={4.5} fill="none" stroke={accentColor} strokeWidth={1.5} opacity={0.18}/>
+        ))}
+      </svg>
+
+      {/* Animal — floats above water, transitions smoothly */}
+      <div style={{
+        position:"absolute", left:"50%",
+        top:`${animalTop}px`,
+        transform:"translateX(-50%)",
+        transition:"top 0.9s cubic-bezier(0.4,0,0.2,1)",
+        animation:"float 3.5s ease-in-out infinite",
+        zIndex:2,
+      }}>
+        <AnimalFace animal={animal} pct={pct} color={animalColor} size={animalSz}/>
+      </div>
+    </div>
+  );
+}
+
+// ── Supporting UI ─────────────────────────────────────────────────────────────
 
 function SwatchGrid({ items, selected, onSelect, renderSwatch, cols=5 }) {
   return (
-    <div style={{display:"grid",gridTemplateColumns:`repeat(${cols},1fr)`,gap:8}}>
-      {items.map(item=>{
-        const sel=item.id===selected;
+    <div style={{ display:"grid", gridTemplateColumns:`repeat(${cols},1fr)`, gap:8 }}>
+      {items.map(item => {
+        const sel = item.id === selected;
         return (
           <button key={item.id} onClick={()=>onSelect(item.id)}
-            style={{border:`3px solid ${sel?"#333":"transparent"}`,borderRadius:14,padding:"8px 4px 6px",cursor:"pointer",background:"white",display:"flex",flexDirection:"column",alignItems:"center",gap:4,boxShadow:sel?"0 2px 10px rgba(0,0,0,0.18)":"0 1px 4px rgba(0,0,0,0.06)",transform:sel?"scale(1.06)":"scale(1)",transition:"transform 0.12s"}}>
+            style={{ border:`3px solid ${sel?"#333":"transparent"}`, borderRadius:14, padding:"8px 4px 6px", cursor:"pointer", background:"white", display:"flex", flexDirection:"column", alignItems:"center", gap:4, boxShadow:sel?"0 2px 10px rgba(0,0,0,0.18)":"0 1px 4px rgba(0,0,0,0.06)", transform:sel?"scale(1.06)":"scale(1)", transition:"transform 0.12s" }}>
             {renderSwatch(item)}
-            <div style={{fontSize:9,fontWeight:800,color:sel?"#333":"#bbb"}}>{item.label}</div>
+            <div style={{ fontSize:9, fontWeight:800, color:sel?"#333":"#bbb" }}>{item.label}</div>
           </button>
         );
       })}
@@ -305,34 +489,22 @@ function SwatchGrid({ items, selected, onSelect, renderSwatch, cols=5 }) {
   );
 }
 
-function Ring({ value, max, color, size=210 }) {
-  const pct=Math.min(value/max,1), r=(size-22)/2, circ=2*Math.PI*r;
-  return (
-    <svg width={size} height={size} style={{transform:"rotate(-90deg)"}}>
-      <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="#e8e8e8" strokeWidth="13"/>
-      <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={color} strokeWidth="13"
-        strokeDasharray={circ} strokeDashoffset={circ*(1-pct)} strokeLinecap="round"
-        style={{transition:"stroke-dashoffset 0.55s cubic-bezier(.4,0,.2,1)"}}/>
-    </svg>
-  );
-}
-
 function WeekChart({ userId, goal, color, logs }) {
-  const days=[...Array(7)].map((_,i)=>{
+  const days = [...Array(7)].map((_,i)=>{
     const d=new Date(); d.setDate(d.getDate()-(6-i));
     const key=`${userId}-${d.toISOString().split("T")[0]}`;
-    return {label:d.toLocaleDateString("en-GB",{weekday:"short"}),val:logs[key]||0,isToday:i===6};
+    return { label:d.toLocaleDateString("en-GB",{weekday:"short"}), val:logs[key]||0, isToday:i===6 };
   });
   return (
-    <div style={{display:"flex",alignItems:"flex-end",gap:6,height:64,padding:"0 4px"}}>
+    <div style={{ display:"flex", alignItems:"flex-end", gap:6, height:64, padding:"0 4px" }}>
       {days.map((d,i)=>{
         const pct=Math.min(d.val/goal,1);
         return (
-          <div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:4}}>
-            <div style={{width:"100%",height:44,borderRadius:8,background:"#f0f0f0",position:"relative",overflow:"hidden"}}>
-              <div style={{position:"absolute",bottom:0,width:"100%",height:`${pct*100}%`,background:pct>=1?"#4CAF85":color,borderRadius:"6px 6px 0 0",transition:"height 0.4s ease"}}/>
+          <div key={i} style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", gap:4 }}>
+            <div style={{ width:"100%", height:44, borderRadius:8, background:"#f0f0f0", position:"relative", overflow:"hidden" }}>
+              <div style={{ position:"absolute", bottom:0, width:"100%", height:`${pct*100}%`, background:pct>=1?"#4CAF85":color, borderRadius:"6px 6px 0 0", transition:"height 0.4s ease" }}/>
             </div>
-            <div style={{fontSize:10,fontWeight:d.isToday?800:600,color:d.isToday?color:"#bbb"}}>{d.label}</div>
+            <div style={{ fontSize:10, fontWeight:d.isToday?800:600, color:d.isToday?color:"#bbb" }}>{d.label}</div>
           </div>
         );
       })}
@@ -344,13 +516,13 @@ function CustomDrink({ color, light, onAdd }) {
   const [open,setOpen]=useState(false), [val,setVal]=useState("");
   const submit=()=>{const ml=parseInt(val);if(ml>0&&ml<=2000){onAdd(ml);setVal("");setOpen(false);}};
   return (
-    <div style={{marginTop:10}}>
+    <div style={{ marginTop:10 }}>
       {!open
-        ?<button onClick={()=>setOpen(true)} style={{width:"100%",border:`2px dashed ${color}55`,background:"transparent",borderRadius:18,padding:"12px",color,fontWeight:800,fontSize:14,cursor:"pointer",fontFamily:"'Nunito',sans-serif"}}>+ Custom amount</button>
-        :<div style={{display:"flex",gap:8,alignItems:"center",background:light,borderRadius:18,padding:"8px 12px",border:`2px solid ${color}33`}}>
-          <input autoFocus type="number" placeholder="ml" value={val} onChange={e=>setVal(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submit()} style={{flex:1,border:"none",background:"transparent",fontSize:18,fontWeight:800,color:"#333",fontFamily:"'Nunito',sans-serif",outline:"none"}}/>
-          <button onClick={submit} style={{background:color,border:"none",borderRadius:12,padding:"8px 18px",color:"white",fontWeight:800,fontSize:14,cursor:"pointer",fontFamily:"'Nunito',sans-serif"}}>Add</button>
-          <button onClick={()=>setOpen(false)} style={{background:"none",border:"none",color:"#bbb",fontWeight:800,fontSize:18,cursor:"pointer"}}>✕</button>
+        ?<button onClick={()=>setOpen(true)} style={{ width:"100%", border:`2px dashed ${color}55`, background:"transparent", borderRadius:18, padding:"12px", color, fontWeight:800, fontSize:14, cursor:"pointer", fontFamily:"'Nunito',sans-serif" }}>+ Custom amount</button>
+        :<div style={{ display:"flex", gap:8, alignItems:"center", background:light, borderRadius:18, padding:"8px 12px", border:`2px solid ${color}33` }}>
+          <input autoFocus type="number" placeholder="ml" value={val} onChange={e=>setVal(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submit()} style={{ flex:1, border:"none", background:"transparent", fontSize:18, fontWeight:800, color:"#333", fontFamily:"'Nunito',sans-serif", outline:"none" }}/>
+          <button onClick={submit} style={{ background:color, border:"none", borderRadius:12, padding:"8px 18px", color:"white", fontWeight:800, fontSize:14, cursor:"pointer", fontFamily:"'Nunito',sans-serif" }}>Add</button>
+          <button onClick={()=>setOpen(false)} style={{ background:"none", border:"none", color:"#bbb", fontWeight:800, fontSize:18, cursor:"pointer" }}>✕</button>
         </div>}
     </div>
   );
@@ -358,86 +530,143 @@ function CustomDrink({ color, light, onAdd }) {
 
 function SectionCard({ title, hint, children }) {
   return (
-    <div style={{background:"white",borderRadius:24,padding:"20px",marginBottom:16,boxShadow:"0 4px 20px rgba(0,0,0,0.05)"}}>
-      <div style={{fontSize:11,fontWeight:800,letterSpacing:1.5,color:"#bbb",marginBottom:hint?4:12}}>{title}</div>
-      {hint&&<div style={{fontSize:11,color:"#ccc",fontWeight:600,marginBottom:12}}>{hint}</div>}
+    <div style={{ background:"white", borderRadius:24, padding:"20px", marginBottom:16, boxShadow:"0 4px 20px rgba(0,0,0,0.05)" }}>
+      <div style={{ fontSize:11, fontWeight:800, letterSpacing:1.5, color:"#bbb", marginBottom:hint?4:12 }}>{title}</div>
+      {hint&&<div style={{ fontSize:11, color:"#ccc", fontWeight:600, marginBottom:12 }}>{hint}</div>}
       {children}
     </div>
   );
 }
 
+// ── Badge screen ──────────────────────────────────────────────────────────────
+function BadgeScreen({ user, logs, onBack }) {
+  const theme   = userTheme(user);
+  const unlocked = getBadges(user.id);
+  const stats    = computeStats(user.id, user.goal, logs);
+  const dcount   = parseInt(localStorage.getItem(`tdd_dcount_${user.id}`) || "0");
+
+  return (
+    <div style={{ minHeight:"100vh", background:theme.light, fontFamily:"'Nunito',sans-serif", maxWidth:430, margin:"0 auto", paddingBottom:48 }}>
+      <div style={{ background:theme.accent, borderRadius:"0 0 36px 36px", padding:"20px 20px 30px", color:"white", display:"flex", alignItems:"center", justifyContent:"space-between", boxShadow:`0 8px 30px ${theme.accent}55` }}>
+        <button onClick={onBack} style={{ background:"rgba(255,255,255,0.18)", border:"none", borderRadius:14, padding:"8px 16px", color:"white", fontSize:13, fontWeight:800, cursor:"pointer", fontFamily:"'Nunito',sans-serif" }}>← Back</button>
+        <div style={{ textAlign:"center" }}>
+          <div style={{ fontWeight:900, fontSize:22 }}>{user.name}'s Badges</div>
+          <div style={{ fontSize:12, opacity:0.8, fontWeight:700, marginTop:1 }}>
+            {Object.keys(unlocked).length} of {BADGES.length} unlocked
+          </div>
+        </div>
+        <div style={{ width:60 }}/>
+      </div>
+
+      {/* Stats strip */}
+      <div style={{ display:"flex", gap:10, padding:"20px 20px 0" }}>
+        {[
+          { label:"Streak",      val:`${stats.streak}d`,   emoji:"🔥" },
+          { label:"Goals Hit",   val:stats.goalsHit,        emoji:"🎯" },
+          { label:"Total Drinks",val:dcount,                emoji:"💧" },
+        ].map((s,i)=>(
+          <div key={i} style={{ flex:1, background:"white", borderRadius:18, padding:"12px 8px", textAlign:"center", boxShadow:"0 4px 16px rgba(0,0,0,0.05)" }}>
+            <div style={{ fontSize:20 }}>{s.emoji}</div>
+            <div style={{ fontWeight:900, fontSize:18, color:theme.dark, marginTop:2 }}>{s.val}</div>
+            <div style={{ fontSize:10, fontWeight:700, color:"#bbb" }}>{s.label}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Badge grid */}
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, padding:"16px 20px 0" }}>
+        {BADGES.map(badge => {
+          const on  = !!unlocked[badge.id];
+          const dt  = unlocked[badge.id] ? new Date(unlocked[badge.id]).toLocaleDateString("en-GB",{day:"numeric",month:"short"}) : null;
+          return (
+            <div key={badge.id} style={{ background:on?"white":"rgba(0,0,0,0.04)", borderRadius:22, padding:"20px 16px", textAlign:"center", opacity:on?1:0.45, boxShadow:on?"0 4px 18px rgba(0,0,0,0.07)":"none", border:on?`2px solid ${theme.accent}28`:"2px solid transparent", transition:"all 0.2s" }}>
+              <div style={{ fontSize:38, marginBottom:8, filter:on?"none":"grayscale(1)" }}>{badge.emoji}</div>
+              <div style={{ fontWeight:900, fontSize:13, color:theme.dark, marginBottom:4 }}>{badge.label}</div>
+              <div style={{ fontSize:11, color:"#bbb", fontWeight:600 }}>{on ? `✓ ${dt}` : badge.desc}</div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 // ── Settings screen ───────────────────────────────────────────────────────────
-
 function SettingsScreen({ user, onSave, onBack }) {
-  const [goal,setGoal]       = useState(user.goal);
-  const [animal,setAnimal]   = useState(user.animal||"cat");
-  const [name,setName]       = useState(user.name);
-  const [themeId,setThemeId] = useState(user.themeId||"teal");
-  const [colorId,setColorId] = useState(user.animalColorId||"mint");
+  const [goal,setGoal]     = useState(user.goal);
+  const [animal,setAnimal] = useState(user.animal||"cat");
+  const [name,setName]     = useState(user.name);
+  const [themeId,setTheme] = useState(user.themeId||"teal");
+  const [colorId,setColor] = useState(user.animalColorId||"mint");
 
-  const presets=[800,1000,1200,1400,1600,1800,2000,2500];
-  const pt=resolveTheme(themeId);
-  const pac=resolveAnimal(colorId).color;
+  const presets = [800,1000,1200,1400,1600,1800,2000,2500];
+  const pt = resolveTheme(themeId);
+  const pac = resolveAnimal(colorId).color;
 
-  const handleSave=()=>{
-    const g=parseInt(goal);
-    if(g>=200&&g<=5000) onSave({...user,goal:g,animal,name:name.trim()||user.name,themeId,animalColorId:colorId});
+  const handleSave = () => {
+    const g = parseInt(goal);
+    if (g >= 200 && g <= 5000) onSave({ ...user, goal:g, animal, name:name.trim()||user.name, themeId, animalColorId:colorId });
   };
 
   return (
-    <div style={{minHeight:"100vh",background:pt.light,fontFamily:"'Nunito',sans-serif",maxWidth:430,margin:"0 auto",paddingBottom:56}}>
-      <div style={{background:pt.accent,borderRadius:"0 0 36px 36px",padding:"20px 20px 30px",color:"white",display:"flex",alignItems:"center",justifyContent:"space-between",boxShadow:`0 8px 30px ${pt.accent}55`}}>
-        <button onClick={onBack} style={{background:"rgba(255,255,255,0.18)",border:"none",borderRadius:14,padding:"8px 16px",color:"white",fontSize:13,fontWeight:800,cursor:"pointer",fontFamily:"'Nunito',sans-serif"}}>← Back</button>
-        <div style={{fontWeight:900,fontSize:22}}>⚙️ Settings</div>
-        <button onClick={handleSave} style={{background:"rgba(255,255,255,0.25)",border:"none",borderRadius:14,padding:"8px 16px",color:"white",fontSize:13,fontWeight:800,cursor:"pointer",fontFamily:"'Nunito',sans-serif"}}>Save ✓</button>
+    <div style={{ minHeight:"100vh", background:pt.light, fontFamily:"'Nunito',sans-serif", maxWidth:430, margin:"0 auto", paddingBottom:56 }}>
+      <div style={{ background:pt.accent, borderRadius:"0 0 36px 36px", padding:"20px 20px 30px", color:"white", display:"flex", alignItems:"center", justifyContent:"space-between", boxShadow:`0 8px 30px ${pt.accent}55` }}>
+        <button onClick={onBack} style={{ background:"rgba(255,255,255,0.18)", border:"none", borderRadius:14, padding:"8px 16px", color:"white", fontSize:13, fontWeight:800, cursor:"pointer", fontFamily:"'Nunito',sans-serif" }}>← Back</button>
+        <div style={{ fontWeight:900, fontSize:22 }}>⚙️ Settings</div>
+        <button onClick={handleSave} style={{ background:"rgba(255,255,255,0.25)", border:"none", borderRadius:14, padding:"8px 16px", color:"white", fontSize:13, fontWeight:800, cursor:"pointer", fontFamily:"'Nunito',sans-serif" }}>Save ✓</button>
       </div>
-      <div style={{padding:"24px 20px 0"}}>
+
+      <div style={{ padding:"24px 20px 0" }}>
         <SectionCard title="NAME">
-          <input value={name} onChange={e=>setName(e.target.value)} style={{width:"100%",border:`2px solid ${pt.accent}44`,borderRadius:14,padding:"12px 16px",fontSize:18,fontWeight:800,color:"#333",fontFamily:"'Nunito',sans-serif",outline:"none",boxSizing:"border-box",background:pt.light}}/>
+          <input value={name} onChange={e=>setName(e.target.value)} style={{ width:"100%", border:`2px solid ${pt.accent}44`, borderRadius:14, padding:"12px 16px", fontSize:18, fontWeight:800, color:"#333", fontFamily:"'Nunito',sans-serif", outline:"none", boxSizing:"border-box", background:pt.light }}/>
         </SectionCard>
-        <SectionCard title="THEME COLOUR" hint="Changes your header, ring and background">
-          <SwatchGrid items={THEME_COLOURS} selected={themeId} onSelect={setThemeId} cols={5}
-            renderSwatch={item=><div style={{width:32,height:32,borderRadius:10,background:item.accent,boxShadow:`0 3px 8px ${item.accent}55`}}/>}/>
+
+        <SectionCard title="THEME COLOUR" hint="Header, ring and background colour">
+          <SwatchGrid items={THEME_COLOURS} selected={themeId} onSelect={setTheme} cols={5}
+            renderSwatch={item=><div style={{ width:32, height:32, borderRadius:10, background:item.accent, boxShadow:`0 3px 8px ${item.accent}55` }}/>}/>
         </SectionCard>
+
         <SectionCard title="PET ANIMAL">
-          <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:8,marginBottom:16}}>
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:8, marginBottom:16 }}>
             {ANIMALS.map(a=>{
               const sel=a.id===animal;
               return (
                 <button key={a.id} onClick={()=>setAnimal(a.id)}
-                  style={{border:`2.5px solid ${sel?pt.accent:"#eee"}`,background:sel?pt.light:"white",borderRadius:18,padding:"10px 4px 8px",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:4,boxShadow:sel?"0 2px 10px rgba(0,0,0,0.1)":"none"}}>
-                  <div style={{fontSize:24}}>{a.emoji}</div>
-                  <div style={{fontSize:9,fontWeight:800,color:sel?pt.accent:"#bbb"}}>{a.label}</div>
+                  style={{ border:`2.5px solid ${sel?pt.accent:"#eee"}`, background:sel?pt.light:"white", borderRadius:18, padding:"10px 4px 8px", cursor:"pointer", display:"flex", flexDirection:"column", alignItems:"center", gap:4, boxShadow:sel?"0 2px 10px rgba(0,0,0,0.1)":"none" }}>
+                  <div style={{ fontSize:24 }}>{a.emoji}</div>
+                  <div style={{ fontSize:9, fontWeight:800, color:sel?pt.accent:"#bbb" }}>{a.label}</div>
                 </button>
               );
             })}
           </div>
-          <div style={{fontSize:11,fontWeight:800,letterSpacing:1.5,color:"#bbb",marginBottom:10}}>ANIMAL COLOUR</div>
-          <SwatchGrid items={ANIMAL_COLOURS} selected={colorId} onSelect={setColorId} cols={5}
-            renderSwatch={item=><div style={{width:32,height:32,borderRadius:"50%",background:item.color,boxShadow:`0 3px 8px ${item.color}55`}}/>}/>
-          <div style={{display:"flex",justifyContent:"center",marginTop:18,padding:"14px",background:pt.light,borderRadius:18,border:`2px solid ${pt.accent}22`}}>
-            <div style={{animation:"float 3s ease-in-out infinite"}}>
+          <div style={{ fontSize:11, fontWeight:800, letterSpacing:1.5, color:"#bbb", marginBottom:10 }}>ANIMAL COLOUR</div>
+          <SwatchGrid items={ANIMAL_COLOURS} selected={colorId} onSelect={setColor} cols={5}
+            renderSwatch={item=><div style={{ width:32, height:32, borderRadius:"50%", background:item.color, boxShadow:`0 3px 8px ${item.color}55` }}/>}/>
+          <div style={{ display:"flex", justifyContent:"center", marginTop:18, padding:"14px", background:pt.light, borderRadius:18, border:`2px solid ${pt.accent}22` }}>
+            <div style={{ animation:"float 3s ease-in-out infinite" }}>
               <AnimalFace animal={animal} pct={0.65} color={pac} size={90}/>
             </div>
           </div>
         </SectionCard>
+
         <SectionCard title="DAILY WATER GOAL" hint="Recommended: 9–11 yr ≈ 1400–1800ml/day">
-          <div style={{display:"flex",flexWrap:"wrap",gap:8,marginBottom:14}}>
+          <div style={{ display:"flex", flexWrap:"wrap", gap:8, marginBottom:14 }}>
             {presets.map(p=>(
               <button key={p} onClick={()=>setGoal(p)}
-                style={{border:`2px solid ${parseInt(goal)===p?pt.accent:"#eee"}`,background:parseInt(goal)===p?pt.light:"white",borderRadius:12,padding:"7px 14px",fontWeight:800,fontSize:13,color:parseInt(goal)===p?pt.accent:"#999",cursor:"pointer",fontFamily:"'Nunito',sans-serif"}}>
+                style={{ border:`2px solid ${parseInt(goal)===p?pt.accent:"#eee"}`, background:parseInt(goal)===p?pt.light:"white", borderRadius:12, padding:"7px 14px", fontWeight:800, fontSize:13, color:parseInt(goal)===p?pt.accent:"#999", cursor:"pointer", fontFamily:"'Nunito',sans-serif" }}>
                 {p}ml
               </button>
             ))}
           </div>
-          <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <div style={{ display:"flex", alignItems:"center", gap:10 }}>
             <input type="number" value={goal} onChange={e=>setGoal(e.target.value)} min="200" max="5000"
-              style={{flex:1,border:`2px solid ${pt.accent}44`,borderRadius:14,padding:"12px 16px",fontSize:20,fontWeight:800,color:"#333",fontFamily:"'Nunito',sans-serif",outline:"none",background:pt.light}}/>
-            <span style={{fontWeight:800,color:"#bbb",fontSize:16}}>ml</span>
+              style={{ flex:1, border:`2px solid ${pt.accent}44`, borderRadius:14, padding:"12px 16px", fontSize:20, fontWeight:800, color:"#333", fontFamily:"'Nunito',sans-serif", outline:"none", background:pt.light }}/>
+            <span style={{ fontWeight:800, color:"#bbb", fontSize:16 }}>ml</span>
           </div>
         </SectionCard>
+
         <button onClick={handleSave}
-          style={{width:"100%",background:pt.accent,border:"none",borderRadius:22,padding:"18px",color:"white",fontSize:18,fontWeight:900,cursor:"pointer",fontFamily:"'Nunito',sans-serif",boxShadow:`0 6px 24px ${pt.accent}55`}}>
+          style={{ width:"100%", background:pt.accent, border:"none", borderRadius:22, padding:"18px", color:"white", fontSize:18, fontWeight:900, cursor:"pointer", fontFamily:"'Nunito',sans-serif", boxShadow:`0 6px 24px ${pt.accent}55` }}>
           Save Changes ✓
         </button>
       </div>
@@ -445,58 +674,98 @@ function SettingsScreen({ user, onSave, onBack }) {
   );
 }
 
-// ── Select screen ─────────────────────────────────────────────────────────────
-
+// ── Select screen — minimal branding, prominent cards ─────────────────────────
 function SelectScreen({ users, logs, onSelect, onSettings }) {
+  const season = getSeasonalTheme();
   return (
-    <div style={{minHeight:"100vh",background:"linear-gradient(160deg,#1a1a2e 0%,#16213e 55%,#0f3460 100%)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"32px 24px",fontFamily:"'Nunito',sans-serif"}}>
-      <div style={{textAlign:"center",marginBottom:40}}>
-        <div style={{fontSize:52,animation:"float 3s ease-in-out infinite"}}>💧</div>
-        <h1 style={{fontFamily:"'Nunito',sans-serif",fontSize:36,fontWeight:900,color:"white",margin:"10px 0 6px",letterSpacing:-1}}>HydroKids</h1>
-        <p style={{color:"rgba(255,255,255,0.5)",fontSize:15,fontWeight:600}}>Keep your pet happy — stay hydrated!</p>
+    <div style={{ minHeight:"100vh", background:`linear-gradient(160deg,${season.bg[0]} 0%,${season.bg[1]} 55%,${season.bg[2]} 100%)`, display:"flex", flexDirection:"column", fontFamily:"'Nunito',sans-serif", position:"relative", overflow:"hidden" }}>
+
+      {/* Floating seasonal decorations */}
+      {season.emojis.map((e,i)=>(
+        <div key={i} style={{ position:"absolute", fontSize:26, opacity:0.13, top:`${[12,22,68,78,42][i]}%`, left:`${[4,82,6,78,48][i]}%`, animation:`float ${2.5+i*0.4}s ease-in-out infinite`, animationDelay:`${i*0.5}s`, pointerEvents:"none" }}>
+          {e}
+        </div>
+      ))}
+
+      {/* Small top bar */}
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"20px 22px 8px" }}>
+        <div style={{ display:"flex", alignItems:"center", gap:7 }}>
+          <span style={{ fontSize:18 }}>💧</span>
+          <span style={{ fontSize:15, fontWeight:900, color:"rgba(255,255,255,0.6)", letterSpacing:-0.3, fontFamily:"'Nunito',sans-serif" }}>The Daily Drink</span>
+        </div>
+        <span style={{ fontSize:11, color:"rgba(255,255,255,0.3)", fontWeight:700 }}>{season.label}</span>
       </div>
-      <div style={{width:"100%",maxWidth:360}}>
+
+      {/* Cards */}
+      <div style={{ flex:1, display:"flex", flexDirection:"column", justifyContent:"center", padding:"12px 18px 28px" }}>
+        <p style={{ color:"rgba(255,255,255,0.4)", fontSize:13, fontWeight:700, margin:"0 0 18px", textAlign:"center", letterSpacing:0.5 }}>
+          Who's drinking today?
+        </p>
+
         {users.map((u,idx)=>{
           const theme=userTheme(u), aColor=userAColor(u);
           const intake=logs[`${u.id}-${today()}`]||0;
-          const pct=Math.round(Math.min(intake/u.goal,1)*100);
+          const pct=Math.min(intake/u.goal,1);
+          const pctRound=Math.round(pct*100);
           const animalInfo=ANIMALS.find(a=>a.id===(u.animal||"cat"));
+          const badgeCount=Object.keys(getBadges(u.id)).length;
+
           return (
-            <div key={u.id} style={{position:"relative",marginBottom:16,animation:`pop 0.4s ease ${idx*0.1}s both`}}>
+            <div key={u.id} style={{ marginBottom:idx<users.length-1?16:0, animation:`pop 0.4s ease ${idx*0.12}s both`, position:"relative" }}>
               <div onClick={()=>onSelect(u)}
-                style={{background:"rgba(255,255,255,0.07)",border:"1.5px solid rgba(255,255,255,0.1)",backdropFilter:"blur(12px)",borderRadius:28,padding:"20px 22px",cursor:"pointer",display:"flex",alignItems:"center",gap:16}}
-                onMouseDown={e=>e.currentTarget.style.transform="scale(0.96)"} onMouseUp={e=>e.currentTarget.style.transform="scale(1)"}>
-                <div style={{width:62,height:62,borderRadius:"50%",background:theme.light,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,border:`2px solid ${theme.accent}33`}}>
-                  <AnimalFace animal={u.animal||"cat"} pct={intake/u.goal} color={aColor} size={52}/>
+                style={{ background:"rgba(255,255,255,0.09)", border:"1.5px solid rgba(255,255,255,0.13)", backdropFilter:"blur(16px)", borderRadius:32, padding:"22px 20px", cursor:"pointer", display:"flex", alignItems:"center", gap:18 }}
+                onMouseDown={e=>e.currentTarget.style.transform="scale(0.97)"} onMouseUp={e=>e.currentTarget.style.transform="scale(1)"}
+                onTouchStart={e=>e.currentTarget.style.transform="scale(0.97)"} onTouchEnd={e=>e.currentTarget.style.transform="scale(1)"}>
+
+                {/* Big animal avatar */}
+                <div style={{ width:80, height:80, borderRadius:"50%", background:theme.light, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0, border:`3px solid ${theme.accent}55`, boxShadow:`0 0 22px ${theme.accent}33` }}>
+                  <AnimalFace animal={u.animal||"cat"} pct={intake/u.goal} color={aColor} size={66}/>
                 </div>
-                <div style={{flex:1}}>
-                  <div style={{display:"flex",alignItems:"center",gap:6}}>
-                    <div style={{fontWeight:900,fontSize:20,color:"white"}}>{u.name}</div>
-                    <div style={{fontSize:14}}>{animalInfo?.emoji}</div>
+
+                <div style={{ flex:1, minWidth:0 }}>
+                  <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:6 }}>
+                    <div style={{ fontWeight:900, fontSize:24, color:"white", letterSpacing:-0.5 }}>{u.name}</div>
+                    <div style={{ fontSize:18 }}>{animalInfo?.emoji}</div>
+                    {badgeCount > 0 && (
+                      <div style={{ background:"rgba(255,215,0,0.22)", border:"1px solid rgba(255,215,0,0.38)", borderRadius:10, padding:"2px 8px", fontSize:11, fontWeight:800, color:"rgba(255,215,0,0.9)" }}>
+                        🏅 {badgeCount}
+                      </div>
+                    )}
                   </div>
-                  <div style={{fontSize:12,color:"rgba(255,255,255,0.4)",marginTop:2,fontWeight:600}}>{intake}ml of {u.goal}ml</div>
-                  <div style={{height:6,background:"rgba(255,255,255,0.1)",borderRadius:3,marginTop:8}}>
-                    <div style={{height:6,borderRadius:3,background:theme.accent,width:`${pct}%`,transition:"width 0.4s ease"}}/>
+
+                  <div style={{ height:8, background:"rgba(255,255,255,0.12)", borderRadius:4, marginBottom:8, overflow:"hidden" }}>
+                    <div style={{ height:8, borderRadius:4, background:pct>=1?"#4CAF85":theme.accent, width:`${pctRound}%`, transition:"width 0.5s ease", boxShadow:`0 0 8px ${pct>=1?"#4CAF8588":theme.accent+"88"}` }}/>
+                  </div>
+
+                  <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+                    <div style={{ fontSize:13, color:"rgba(255,255,255,0.45)", fontWeight:700 }}>
+                      {intake}ml <span style={{ opacity:0.5 }}>/ {u.goal}ml</span>
+                    </div>
+                    <div style={{ background:pct>=1?"#4CAF85":theme.accent, borderRadius:12, padding:"4px 14px", fontWeight:900, fontSize:15, color:"white", boxShadow:`0 2px 8px ${pct>=1?"#4CAF8566":theme.accent+"66"}` }}>
+                      {pctRound}%
+                    </div>
                   </div>
                 </div>
-                <div style={{background:pct>=100?"#4CAF85":theme.accent,borderRadius:14,padding:"6px 12px",fontWeight:800,fontSize:14,color:"white",flexShrink:0}}>{pct}%</div>
               </div>
-              <button onClick={()=>onSettings(u)}
-                style={{position:"absolute",top:-8,right:-8,width:34,height:34,borderRadius:"50%",background:"rgba(255,255,255,0.15)",border:"1.5px solid rgba(255,255,255,0.2)",color:"white",fontSize:15,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",backdropFilter:"blur(8px)"}}>
+
+              <button onClick={e=>{e.stopPropagation();onSettings(u);}}
+                style={{ position:"absolute", top:-6, right:-6, width:36, height:36, borderRadius:"50%", background:"rgba(255,255,255,0.14)", border:"1.5px solid rgba(255,255,255,0.25)", color:"white", fontSize:15, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", backdropFilter:"blur(8px)" }}>
                 ⚙️
               </button>
             </div>
           );
         })}
       </div>
-      <p style={{color:"rgba(255,255,255,0.2)",fontSize:12,marginTop:28,fontWeight:600}}>☁️ Cloud sync enabled · tap ⚙️ for settings</p>
+
+      <p style={{ color:"rgba(255,255,255,0.14)", fontSize:11, textAlign:"center", margin:"0 0 16px", fontWeight:600 }}>
+        ☁️ Cloud sync enabled
+      </p>
     </div>
   );
 }
 
 // ── Root ──────────────────────────────────────────────────────────────────────
-
-export default function HydroKids() {
+export default function TheDailyDrink() {
   const [screen,setScreen]           = useState("select");
   const [users,setUsers]             = useState(DEFAULT_USERS);
   const [user,setUser]               = useState(null);
@@ -504,165 +773,216 @@ export default function HydroKids() {
   const [celebrating,setCelebrating] = useState(false);
   const [justAdded,setJustAdded]     = useState(null);
   const [syncing,setSyncing]         = useState(false);
+  const [newBadge,setNewBadge]       = useState(null);
 
-  const persistLogs  = useCallback(nl=>{setLogs(nl); try{localStorage.setItem("hydrokids_logs",JSON.stringify(nl));}catch{}},[]);
-  const persistUsers = useCallback(nu=>{setUsers(nu);try{localStorage.setItem("hydrokids_users",JSON.stringify(nu));}catch{}},[]);
+  const persistLogs  = useCallback(nl=>{setLogs(nl);  try{localStorage.setItem("hydrokids_logs",JSON.stringify(nl));}catch{}}, []);
+  const persistUsers = useCallback(nu=>{setUsers(nu); try{localStorage.setItem("hydrokids_users",JSON.stringify(nu));}catch{}}, []);
 
   useEffect(()=>{
-    const init=async()=>{
+    const init = async () => {
       try {
-        const sl=localStorage.getItem("hydrokids_logs");
-        const su=localStorage.getItem("hydrokids_users");
-        let localLogs=sl?JSON.parse(sl):{};
-        let localUsers=su?JSON.parse(su):DEFAULT_USERS;
+        const sl = localStorage.getItem("hydrokids_logs");
+        const su = localStorage.getItem("hydrokids_users");
+        let localLogs  = sl ? JSON.parse(sl) : {};
+        let localUsers = su ? JSON.parse(su) : DEFAULT_USERS;
         setLogs(localLogs);
         setUsers(localUsers);
         setSyncing(true);
-        // Merge both logs and profiles from Sheets in parallel
-        const [mergedLogs, mergedUsers] = await Promise.all([
+        const [mLogs, mUsers] = await Promise.all([
           fetchAndMergeLogs(localLogs),
           fetchAndMergeProfiles(localUsers),
         ]);
-        persistLogs(mergedLogs);
-        persistUsers(mergedUsers);
-        syncAll(mergedLogs);
-      } catch(e) {
-        console.warn("Init error:", e);
-      } finally {
-        setSyncing(false);
-      }
+        persistLogs(mLogs);
+        persistUsers(mUsers);
+        syncAll(mLogs);
+      } catch(e) { console.warn("init:", e); }
+      finally { setSyncing(false); }
     };
     init();
-  },[]);
+  }, []);
 
-  const addDrink=ml=>{
-    const key=`${user.id}-${today()}`;
-    const prev=logs[key]||0, next=prev+ml;
-    persistLogs({...logs,[key]:next});
-    syncLog(user.id,today(),next);
+  const addDrink = ml => {
+    const key  = `${user.id}-${today()}`;
+    const prev = logs[key]||0, next = prev + ml;
+    persistLogs({ ...logs, [key]:next });
+    syncLog(user.id, today(), next);
+
+    // Drink counter
+    const dc = parseInt(localStorage.getItem(`tdd_dcount_${user.id}`) || "0") + 1;
+    localStorage.setItem(`tdd_dcount_${user.id}`, String(dc));
+
+    playSound("splash");
+
     setJustAdded(`+${ml}ml`);
-    setTimeout(()=>setJustAdded(null),1400);
-    if(next>=user.goal&&prev<user.goal){setCelebrating(true);setTimeout(()=>setCelebrating(false),3200);}
+    setTimeout(()=>setJustAdded(null), 1400);
+
+    const { newOnes } = checkBadges(user.id, user.goal, { ...logs, [key]:next });
+    if (newOnes.length) {
+      playSound("badge");
+      setNewBadge(newOnes[0]);
+      setTimeout(()=>setNewBadge(null), 3000);
+    }
+
+    if (next >= user.goal && prev < user.goal) {
+      setTimeout(()=>{ playSound("fanfare"); setCelebrating(true); }, 200);
+      setTimeout(()=>setCelebrating(false), 3500);
+    }
   };
 
-  const undoLast=()=>{
-    const key=`${user.id}-${today()}`;
-    const prev=logs[key]||0;
-    if(prev===0) return;
-    const next=Math.max(0,prev-100);
-    persistLogs({...logs,[key]:next});
-    syncLog(user.id,today(),next);
+  const undoLast = () => {
+    const key  = `${user.id}-${today()}`;
+    const prev = logs[key]||0;
+    if (prev === 0) return;
+    const next = Math.max(0, prev - 100);
+    persistLogs({ ...logs, [key]:next });
+    syncLog(user.id, today(), next);
   };
 
-  const getStreak=(userId,goalAmt)=>{
+  const getStreak = (userId, goalAmt) => {
     let s=0;
     for(let i=0;i<60;i++){
-      const d=new Date();d.setDate(d.getDate()-i);
+      const d=new Date(); d.setDate(d.getDate()-i);
       const key=`${userId}-${d.toISOString().split("T")[0]}`;
       if((logs[key]||0)>=goalAmt) s++; else if(i>0) break;
     }
     return s;
   };
 
-  const saveSettings=updated=>{
+  const saveSettings = updated => {
     persistUsers(users.map(u=>u.id===updated.id?updated:u));
     setUser(updated);
-    syncProfile(updated);   // push profile to Sheets immediately
+    syncProfile(updated);
     setScreen("main");
   };
 
-  const CSS=`
+  const CSS = `
     @import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&display=swap');
-    @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-7px)}}
-    @keyframes pop{0%{transform:scale(0.7) translateY(10px);opacity:0}100%{transform:scale(1) translateY(0);opacity:1}}
-    @keyframes toastUp{0%{opacity:0;transform:translateY(0)}20%{opacity:1;transform:translateY(-14px)}80%{opacity:1;transform:translateY(-14px)}100%{opacity:0;transform:translateY(-28px)}}
-    @keyframes celebrate{0%{transform:scale(0.5);opacity:0}60%{transform:scale(1.08)}100%{transform:scale(1);opacity:1}}
-    @keyframes fadeUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
-    @keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+    @keyframes float      { 0%,100%{transform:translateY(0)}   50%{transform:translateY(-7px)} }
+    @keyframes pop        { 0%{transform:scale(0.7) translateY(10px);opacity:0} 100%{transform:scale(1) translateY(0);opacity:1} }
+    @keyframes toastUp    { 0%{opacity:0;transform:translateY(0)} 20%{opacity:1;transform:translateY(-14px)} 80%{opacity:1;transform:translateY(-14px)} 100%{opacity:0;transform:translateY(-28px)} }
+    @keyframes celebrate  { 0%{transform:scale(0.5);opacity:0} 60%{transform:scale(1.08)} 100%{transform:scale(1);opacity:1} }
+    @keyframes fadeUp     { from{opacity:0;transform:translateY(12px)} to{opacity:1;transform:translateY(0)} }
+    @keyframes spin       { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
+    @keyframes badgePop   { 0%{transform:scale(0.4) translateY(20px);opacity:0} 60%{transform:scale(1.1)} 100%{transform:scale(1);opacity:1} }
+    @keyframes tankWave1  { from{transform:translateX(0)} to{transform:translateX(-176px)} }
+    @keyframes tankWave2  { from{transform:translateX(0)} to{transform:translateX(176px)} }
+    @keyframes bubbleRise { 0%{transform:translateY(0);opacity:0.35} 100%{transform:translateY(-55px);opacity:0} }
   `;
 
-  if(screen==="select") return (
+  if (screen==="select") return (
     <>
       <style>{CSS}</style>
-      {syncing&&<div style={{position:"fixed",top:12,right:12,zIndex:200,background:"rgba(0,0,0,0.5)",borderRadius:20,padding:"6px 12px",color:"white",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:6}}><span style={{display:"inline-block",animation:"spin 1s linear infinite"}}>⟳</span> Syncing…</div>}
+      {syncing&&<div style={{ position:"fixed", top:12, right:12, zIndex:200, background:"rgba(0,0,0,0.5)", borderRadius:20, padding:"6px 12px", color:"white", fontSize:11, fontWeight:700, display:"flex", alignItems:"center", gap:6 }}><span style={{ display:"inline-block", animation:"spin 1s linear infinite" }}>⟳</span> Syncing…</div>}
       <SelectScreen users={users} logs={logs} onSelect={u=>{setUser(u);setScreen("main");}} onSettings={u=>{setUser(u);setScreen("settings");}}/>
     </>
   );
 
-  if(screen==="settings") return (
+  if (screen==="settings") return (
     <><style>{CSS}</style><SettingsScreen user={user} onSave={saveSettings} onBack={()=>setScreen("main")}/></>
   );
 
-  const cu=users.find(u=>u.id===user.id)||user;
-  const theme=userTheme(cu), aColor=userAColor(cu);
-  const intake=logs[`${cu.id}-${today()}`]||0;
-  const hydPct=intake/cu.goal, streak=getStreak(cu.id,cu.goal), remaining=Math.max(0,cu.goal-intake);
-  const mood=hydPct>=1?{text:"Goal smashed! 🎉",sub:"Your pet is glowing!"}
-            :hydPct>=.75?{text:"Almost there! 💪",sub:`Just ${remaining}ml to go`}
-            :hydPct>=.4?{text:"Good progress 👍",sub:`${remaining}ml remaining`}
-            :{text:"Thirsty! Please drink 😰",sub:`${remaining}ml to go`};
-  const animalLabel=ANIMALS.find(a=>a.id===(cu.animal||"cat"));
+  if (screen==="badges") return (
+    <><style>{CSS}</style><BadgeScreen user={user} logs={logs} onBack={()=>setScreen("main")}/></>
+  );
+
+  // ── Main hydration screen ──
+  const cu          = users.find(u=>u.id===user.id)||user;
+  const theme       = userTheme(cu);
+  const aColor      = userAColor(cu);
+  const intake      = logs[`${cu.id}-${today()}`]||0;
+  const hydPct      = intake/cu.goal;
+  const streak      = getStreak(cu.id, cu.goal);
+  const remaining   = Math.max(0, cu.goal-intake);
+  const mood        = hydPct>=1   ? { text:"Goal smashed! 🎉",        sub:"Your pet is glowing!" }
+                    : hydPct>=.75 ? { text:"Almost there! 💪",        sub:`Just ${remaining}ml to go` }
+                    : hydPct>=.4  ? { text:"Good progress 👍",        sub:`${remaining}ml remaining` }
+                                  : { text:"Thirsty! Please drink 😰", sub:`${remaining}ml to go` };
+  const animalLabel = ANIMALS.find(a=>a.id===(cu.animal||"cat"));
+  const badgeCount  = Object.keys(getBadges(cu.id)).length;
 
   return (
-    <div style={{minHeight:"100vh",background:theme.light,fontFamily:"'Nunito',sans-serif",maxWidth:430,margin:"0 auto",paddingBottom:40,position:"relative",overflow:"hidden"}}>
+    <div style={{ minHeight:"100vh", background:theme.light, fontFamily:"'Nunito',sans-serif", maxWidth:430, margin:"0 auto", paddingBottom:40, position:"relative", overflow:"hidden" }}>
       <style>{CSS}</style>
-      <div style={{background:theme.accent,borderRadius:"0 0 36px 36px",padding:"20px 20px 30px",color:"white",display:"flex",alignItems:"center",justifyContent:"space-between",boxShadow:`0 8px 30px ${theme.accent}55`}}>
-        <button onClick={()=>setScreen("select")} style={{background:"rgba(255,255,255,0.18)",border:"none",borderRadius:14,padding:"8px 16px",color:"white",fontSize:13,fontWeight:800,cursor:"pointer",fontFamily:"'Nunito',sans-serif"}}>← Back</button>
-        <div style={{textAlign:"center"}}>
-          <div style={{fontWeight:900,fontSize:22,letterSpacing:-0.5}}>{cu.name} {animalLabel?.emoji}</div>
-          <div style={{fontSize:12,opacity:0.8,fontWeight:700,marginTop:1}}>{streak>0?`🔥 ${streak} day streak`:"Start your streak today!"}</div>
+
+      {/* Header */}
+      <div style={{ background:theme.accent, borderRadius:"0 0 36px 36px", padding:"20px 20px 28px", color:"white", display:"flex", alignItems:"center", justifyContent:"space-between", boxShadow:`0 8px 30px ${theme.accent}55` }}>
+        <button onClick={()=>setScreen("select")} style={{ background:"rgba(255,255,255,0.18)", border:"none", borderRadius:14, padding:"8px 16px", color:"white", fontSize:13, fontWeight:800, cursor:"pointer", fontFamily:"'Nunito',sans-serif" }}>← Back</button>
+        <div style={{ textAlign:"center" }}>
+          <div style={{ fontWeight:900, fontSize:22, letterSpacing:-0.5 }}>{cu.name} {animalLabel?.emoji}</div>
+          <div style={{ fontSize:12, opacity:0.8, fontWeight:700, marginTop:1 }}>{streak>0?`🔥 ${streak} day streak`:"Start your streak today!"}</div>
         </div>
-        <div style={{display:"flex",gap:6}}>
-          <button onClick={undoLast} style={{background:"rgba(255,255,255,0.18)",border:"none",borderRadius:14,padding:"8px 12px",color:"white",fontSize:13,fontWeight:800,cursor:"pointer",fontFamily:"'Nunito',sans-serif"}}>↩</button>
-          <button onClick={()=>setScreen("settings")} style={{background:"rgba(255,255,255,0.18)",border:"none",borderRadius:14,padding:"8px 12px",color:"white",fontSize:15,cursor:"pointer"}}>⚙️</button>
-        </div>
-      </div>
-      <div style={{display:"flex",flexDirection:"column",alignItems:"center",padding:"28px 24px 8px"}}>
-        <div style={{position:"relative",width:210,height:210}}>
-          <Ring value={intake} max={cu.goal} color={theme.accent} size={210}/>
-          <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center"}}>
-            <div style={{animation:"float 3.5s ease-in-out infinite"}}>
-              <AnimalFace animal={cu.animal||"cat"} pct={hydPct} color={aColor} size={118}/>
-            </div>
-          </div>
-        </div>
-        <div style={{textAlign:"center",marginTop:6}}>
-          <div style={{fontSize:40,fontWeight:900,color:theme.dark,lineHeight:1,letterSpacing:-1}}>{intake}<span style={{fontSize:18,fontWeight:700,color:"#bbb",marginLeft:4}}>ml</span></div>
-          <div style={{fontWeight:700,color:"#bbb",fontSize:13,marginTop:2}}>of {cu.goal}ml daily goal</div>
-          <div style={{marginTop:10,background:theme.accent+"18",borderRadius:16,padding:"8px 20px",display:"inline-block"}}>
-            <div style={{fontWeight:800,color:theme.accent,fontSize:15}}>{mood.text}</div>
-            <div style={{fontWeight:600,color:theme.accent+"aa",fontSize:12,marginTop:1}}>{mood.sub}</div>
-          </div>
+        <div style={{ display:"flex", gap:6 }}>
+          <button onClick={undoLast} style={{ background:"rgba(255,255,255,0.18)", border:"none", borderRadius:14, padding:"8px 12px", color:"white", fontSize:13, fontWeight:800, cursor:"pointer", fontFamily:"'Nunito',sans-serif" }}>↩</button>
+          <button onClick={()=>setScreen("badges")} style={{ background:"rgba(255,255,255,0.18)", border:"none", borderRadius:14, padding:"8px 10px", color:"white", fontSize:14, cursor:"pointer", position:"relative" }}>
+            🏅
+            {badgeCount>0&&<div style={{ position:"absolute", top:-4, right:-4, background:"#FFD700", borderRadius:"50%", width:16, height:16, fontSize:9, fontWeight:900, color:"#333", display:"flex", alignItems:"center", justifyContent:"center" }}>{badgeCount}</div>}
+          </button>
+          <button onClick={()=>setScreen("settings")} style={{ background:"rgba(255,255,255,0.18)", border:"none", borderRadius:14, padding:"8px 10px", color:"white", fontSize:14, cursor:"pointer" }}>⚙️</button>
         </div>
       </div>
-      <div style={{padding:"20px 20px 0"}}>
-        <div style={{fontSize:11,fontWeight:800,letterSpacing:1.5,color:"#bbb",marginBottom:10}}>ADD A DRINK</div>
-        <div style={{display:"flex",gap:10}}>
+
+      {/* Water tank */}
+      <div style={{ display:"flex", flexDirection:"column", alignItems:"center", padding:"22px 24px 4px" }}>
+        <WaterTank value={intake} max={cu.goal} accentColor={theme.accent} lightColor={theme.light} animal={cu.animal||"cat"} animalColor={aColor}/>
+
+        <div style={{ textAlign:"center", marginTop:8 }}>
+          <div style={{ fontSize:38, fontWeight:900, color:theme.dark, lineHeight:1, letterSpacing:-1 }}>
+            {intake}<span style={{ fontSize:17, fontWeight:700, color:"#bbb", marginLeft:3 }}>ml</span>
+          </div>
+          <div style={{ fontWeight:700, color:"#bbb", fontSize:13, marginTop:2 }}>of {cu.goal}ml daily goal</div>
+          <div style={{ marginTop:8, background:theme.accent+"18", borderRadius:16, padding:"7px 18px", display:"inline-block" }}>
+            <div style={{ fontWeight:800, color:theme.accent, fontSize:14 }}>{mood.text}</div>
+            <div style={{ fontWeight:600, color:theme.accent+"aa", fontSize:11, marginTop:1 }}>{mood.sub}</div>
+          </div>
+        </div>
+      </div>
+
+      {/* Drink buttons */}
+      <div style={{ padding:"16px 20px 0" }}>
+        <div style={{ fontSize:11, fontWeight:800, letterSpacing:1.5, color:"#bbb", marginBottom:10 }}>ADD A DRINK</div>
+        <div style={{ display:"flex", gap:10 }}>
           {DRINKS.map(d=>(
             <button key={d.label} onClick={()=>addDrink(d.ml)}
-              style={{flex:1,border:"none",background:"white",borderRadius:22,padding:"16px 8px",cursor:"pointer",fontFamily:"'Nunito',sans-serif",boxShadow:"0 4px 16px rgba(0,0,0,0.07)",outline:`2.5px solid ${aColor}30`,transition:"transform 0.1s"}}
+              style={{ flex:1, border:"none", background:"white", borderRadius:22, padding:"14px 8px", cursor:"pointer", fontFamily:"'Nunito',sans-serif", boxShadow:"0 4px 16px rgba(0,0,0,0.07)", outline:`2.5px solid ${aColor}30`, transition:"transform 0.1s" }}
               onMouseDown={e=>e.currentTarget.style.transform="scale(0.93)"} onMouseUp={e=>e.currentTarget.style.transform="scale(1)"}>
-              <div style={{fontSize:28}}>{d.emoji}</div>
-              <div style={{fontWeight:900,fontSize:13,color:theme.dark,marginTop:4}}>{d.label}</div>
-              <div style={{fontWeight:700,fontSize:11,color:"#bbb"}}>{d.ml}ml</div>
+              <div style={{ fontSize:26 }}>{d.emoji}</div>
+              <div style={{ fontWeight:900, fontSize:13, color:theme.dark, marginTop:3 }}>{d.label}</div>
+              <div style={{ fontWeight:700, fontSize:11, color:"#bbb" }}>{d.ml}ml</div>
             </button>
           ))}
         </div>
         <CustomDrink color={theme.accent} light={theme.light} onAdd={addDrink}/>
       </div>
-      <div style={{padding:"20px 20px 0"}}>
-        <div style={{background:"white",borderRadius:24,padding:"18px 18px 14px",boxShadow:"0 4px 20px rgba(0,0,0,0.05)"}}>
-          <div style={{fontSize:11,fontWeight:800,letterSpacing:1.5,color:"#bbb",marginBottom:14}}>THIS WEEK</div>
+
+      {/* Week chart */}
+      <div style={{ padding:"16px 20px 0" }}>
+        <div style={{ background:"white", borderRadius:24, padding:"16px 16px 12px", boxShadow:"0 4px 20px rgba(0,0,0,0.05)" }}>
+          <div style={{ fontSize:11, fontWeight:800, letterSpacing:1.5, color:"#bbb", marginBottom:12 }}>THIS WEEK</div>
           <WeekChart userId={cu.id} goal={cu.goal} color={theme.accent} logs={logs}/>
         </div>
       </div>
-      {justAdded&&<div style={{position:"fixed",bottom:100,left:"50%",transform:"translateX(-50%)",background:theme.accent,color:"white",fontWeight:900,fontSize:18,borderRadius:20,padding:"10px 28px",animation:"toastUp 1.4s ease forwards",pointerEvents:"none",zIndex:50}}>{justAdded} 💧</div>}
-      {celebrating&&<div onClick={()=>setCelebrating(false)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",zIndex:100,cursor:"pointer",animation:"fadeUp 0.3s ease"}}>
-        <div style={{animation:"celebrate 0.5s ease",textAlign:"center"}}>
-          <div style={{fontSize:90}}>🎉</div>
-          <div style={{fontFamily:"'Nunito',sans-serif",fontWeight:900,fontSize:32,color:"white",lineHeight:1.2,marginTop:12}}>Goal reached,<br/>{cu.name}!</div>
-          <div style={{color:"rgba(255,255,255,0.7)",fontSize:16,fontWeight:700,marginTop:10}}>Your {animalLabel?.label} is SO happy! {animalLabel?.emoji}✨</div>
-          <div style={{color:"rgba(255,255,255,0.4)",fontSize:13,marginTop:24}}>Tap to continue</div>
+
+      {/* Drink toast */}
+      {justAdded&&<div style={{ position:"fixed", bottom:100, left:"50%", transform:"translateX(-50%)", background:theme.accent, color:"white", fontWeight:900, fontSize:18, borderRadius:20, padding:"10px 28px", animation:"toastUp 1.4s ease forwards", pointerEvents:"none", zIndex:50 }}>{justAdded} 💧</div>}
+
+      {/* Badge unlock toast */}
+      {newBadge&&(
+        <div style={{ position:"fixed", bottom:140, left:"50%", transform:"translateX(-50%)", background:"#1a1a2e", color:"white", borderRadius:24, padding:"14px 22px", zIndex:60, animation:"badgePop 0.4s ease", display:"flex", alignItems:"center", gap:12, boxShadow:"0 8px 32px rgba(0,0,0,0.4)", pointerEvents:"none", whiteSpace:"nowrap" }}>
+          <span style={{ fontSize:30 }}>{newBadge.emoji}</span>
+          <div>
+            <div style={{ fontSize:11, fontWeight:700, color:"#FFD700", letterSpacing:1 }}>BADGE UNLOCKED</div>
+            <div style={{ fontSize:15, fontWeight:900 }}>{newBadge.label}</div>
+          </div>
+        </div>
+      )}
+
+      {/* Goal celebration */}
+      {celebrating&&<div onClick={()=>setCelebrating(false)} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.55)", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", zIndex:100, cursor:"pointer", animation:"fadeUp 0.3s ease" }}>
+        <div style={{ animation:"celebrate 0.5s ease", textAlign:"center" }}>
+          <div style={{ fontSize:90 }}>🎉</div>
+          <div style={{ fontFamily:"'Nunito',sans-serif", fontWeight:900, fontSize:32, color:"white", lineHeight:1.2, marginTop:12 }}>Goal reached,<br/>{cu.name}!</div>
+          <div style={{ color:"rgba(255,255,255,0.7)", fontSize:16, fontWeight:700, marginTop:10 }}>Your {animalLabel?.label} is SO happy! {animalLabel?.emoji}✨</div>
+          <div style={{ color:"rgba(255,255,255,0.4)", fontSize:13, marginTop:24 }}>Tap to continue</div>
         </div>
       </div>}
     </div>
