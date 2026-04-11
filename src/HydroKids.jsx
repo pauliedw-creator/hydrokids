@@ -36,6 +36,18 @@ async function syncProfile(user) {
   } catch(e) { console.warn("syncProfile:", e); }
 }
 
+// Push a single badge (or badge count update) to Sheets
+async function syncBadge(userId, badgeId, count, firstEarned, lastEarned) {
+  if (!APPS_SCRIPT_URL) return;
+  try {
+    await fetch(APPS_SCRIPT_URL + "?action=badge", {
+      method:"POST", mode:"no-cors",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({ userId, badgeId, count, firstEarned, lastEarned }),
+    });
+  } catch(e) { console.warn("syncBadge:", e); }
+}
+
 async function fetchAndMergeLogs(local) {
   if (!APPS_SCRIPT_URL) return local;
   try {
@@ -60,13 +72,30 @@ async function fetchAndMergeProfiles(localUsers) {
   } catch(e) { return localUsers; }
 }
 
+// Fetch badges for one user from Sheets and merge with local.
+// Remote wins if its count is higher — never decreases a tally.
+async function fetchAndMergeBadges(localBadges, userId) {
+  if (!APPS_SCRIPT_URL) return localBadges;
+  try {
+    const res = await fetch(APPS_SCRIPT_URL + `?action=badges&userId=${userId}`);
+    const j   = await res.json();
+    if (j.status !== "ok") return localBadges;
+    const remote = j.data.badges; // { badgeId: { count, first, last } }
+    const merged = { ...localBadges };
+    Object.entries(remote).forEach(([id, rb]) => {
+      const lb = merged[id];
+      if (!lb || rb.count > lb.count) merged[id] = rb;
+    });
+    return merged;
+  } catch(e) { return localBadges; }
+}
+
 // ── Sound effects ─────────────────────────────────────────────────────────────
 function playSound(type) {
   try {
     const AC = window.AudioContext || window.webkitAudioContext;
     if (!AC) return;
     const ctx = new AC();
-
     const note = (freq, start, dur, vol=0.3, wave="sine") => {
       const osc = ctx.createOscillator();
       const g   = ctx.createGain();
@@ -78,79 +107,138 @@ function playSound(type) {
       osc.start(ctx.currentTime + start);
       osc.stop(ctx.currentTime + start + dur + 0.02);
     };
-
     if (type === "splash") {
-      note(700, 0,    0.12, 0.35, "sine");
-      note(500, 0,    0.15, 0.2,  "sine");
-      note(950, 0.05, 0.1,  0.15, "sine");
+      note(700, 0, 0.12, 0.35, "sine");
+      note(500, 0, 0.15, 0.2,  "sine");
+      note(950, 0.05, 0.1, 0.15, "sine");
     } else if (type === "fanfare") {
-      [[523, 0],[659, 0.11],[784, 0.22],[1047, 0.33]].forEach(([f,t]) => note(f, t, 0.28, 0.28, "triangle"));
+      [[523,0],[659,0.11],[784,0.22],[1047,0.33]].forEach(([f,t]) => note(f, t, 0.28, 0.28, "triangle"));
     } else if (type === "badge") {
       [[440,0],[554,0.08],[659,0.16],[880,0.24]].forEach(([f,t]) => note(f, t, 0.22, 0.2, "sine"));
     }
-  } catch(e) { /* sound not supported */ }
+  } catch(e) {}
 }
 
 // ── Badges ────────────────────────────────────────────────────────────────────
+// repeatable: true  → count increments each time condition is met again
+// repeatable: false → one-time unlock, count stays at 1
 const BADGES = [
-  { id:"first_drink",    emoji:"💧", label:"First Sip",      desc:"Log your very first drink"      },
-  { id:"first_goal",     emoji:"🎯", label:"Goal Getter",    desc:"Hit your daily goal for the first time" },
-  { id:"streak_3",       emoji:"🔥", label:"On Fire",        desc:"3 day streak"                   },
-  { id:"streak_7",       emoji:"⚡", label:"Week Warrior",   desc:"7 day streak"                   },
-  { id:"streak_30",      emoji:"🏆", label:"Monthly Master", desc:"30 day streak"                  },
-  { id:"century",        emoji:"💯", label:"Century Club",   desc:"Log 100 drinks total"           },
-  { id:"perfect_week",   emoji:"🌊", label:"Perfect Week",   desc:"Hit goal every day for 7 days"  },
-  { id:"super_hydrated", emoji:"⭐", label:"Super Hydrated", desc:"Exceed your goal by 20% in a day"},
+  { id:"first_drink",    emoji:"💧", label:"First Sip",      desc:"Log your very first drink",                repeatable:false },
+  { id:"first_goal",     emoji:"🎯", label:"Goal Getter",    desc:"Hit your daily goal for the first time",   repeatable:false },
+  { id:"streak_3",       emoji:"🔥", label:"On Fire",        desc:"Reach a 3 day streak",                     repeatable:false },
+  { id:"streak_7",       emoji:"⚡", label:"Week Warrior",   desc:"Reach a 7 day streak",                     repeatable:false },
+  { id:"streak_30",      emoji:"🏆", label:"Monthly Master", desc:"Reach a 30 day streak",                    repeatable:false },
+  { id:"century",        emoji:"💯", label:"Century Club",   desc:"Every 100 drinks logged",                  repeatable:true  },
+  { id:"perfect_week",   emoji:"🌊", label:"Perfect Week",   desc:"Hit your goal 7 days in a row",            repeatable:true  },
+  { id:"super_hydrated", emoji:"⭐", label:"Super Hydrated", desc:"Exceed your goal by 20% in a day",         repeatable:true  },
 ];
 
+// Migrate old badge format { id: "timestamp" } to new { id: { count, first, last } }
+function migrateBadges(raw) {
+  const out = {};
+  Object.entries(raw).forEach(([id, val]) => {
+    out[id] = typeof val === "string"
+      ? { count:1, first:val, last:val }
+      : val;
+  });
+  return out;
+}
+
+function loadBadges(userId) {
+  return migrateBadges(JSON.parse(localStorage.getItem(`tdd_badges_${userId}`) || "{}"));
+}
+
+function saveBadgesLocal(userId, badges) {
+  localStorage.setItem(`tdd_badges_${userId}`, JSON.stringify(badges));
+}
+
 function computeStats(userId, goal, logs) {
-  const t = today();
-  let streak = 0, goalsHit = 0, perfectWeek = true;
+  const todayStr = today();
+  let streak = 0, goalsHit = 0;
+
+  // Current streak
   for (let i = 0; i < 60; i++) {
     const d = new Date(); d.setDate(d.getDate() - i);
     const key = `${userId}-${d.toISOString().split("T")[0]}`;
-    const val = logs[key] || 0;
-    if (val >= goal) { streak++; goalsHit++; }
-    else if (i > 0) { if (i < 7) perfectWeek = false; break; }
-    if (i === 0 && val < goal) perfectWeek = false;
-    if (i < 7 && val < goal) perfectWeek = false;
+    if ((logs[key] || 0) >= goal) streak++;
+    else if (i > 0) break;
   }
-  const todayVal  = logs[`${userId}-${t}`] || 0;
+
+  // All-time goals hit
+  Object.entries(logs).forEach(([key, val]) => {
+    if (key.startsWith(userId + "-") && val >= goal) goalsHit++;
+  });
+
+  // Perfect week count — every 7 consecutive goal days = 1 perfect week
+  let perfectWeeks = 0, run = 0;
+  for (let i = 364; i >= 0; i--) {
+    const d = new Date(); d.setDate(d.getDate() - i);
+    const key = `${userId}-${d.toISOString().split("T")[0]}`;
+    if ((logs[key] || 0) >= goal) {
+      run++;
+      if (run % 7 === 0) perfectWeeks++;
+    } else {
+      run = 0;
+    }
+  }
+
+  // Today exceeded goal
+  const todayVal     = logs[`${userId}-${todayStr}`] || 0;
   const exceededGoal = todayVal >= goal * 1.2;
-  return { streak, goalsHit, perfectWeek, exceededGoal };
+
+  // Total days ever exceeded goal by 20%+
+  const superHydratedDays = Object.entries(logs)
+    .filter(([key, val]) => key.startsWith(userId + "-") && val >= goal * 1.2)
+    .length;
+
+  return { streak, goalsHit, perfectWeeks, exceededGoal, superHydratedDays };
 }
 
+// Returns { saved: updatedBadgeMap, newOnes: [ { ...badge, isFirstUnlock, newCount } ] }
 function checkBadges(userId, goal, logs) {
-  const stats     = computeStats(userId, goal, logs);
-  const dcount    = parseInt(localStorage.getItem(`tdd_dcount_${userId}`) || "0");
+  const stats    = computeStats(userId, goal, logs);
+  const dcount   = parseInt(localStorage.getItem(`tdd_dcount_${userId}`) || "0");
   stats.totalDrinks = dcount;
-  const saved     = JSON.parse(localStorage.getItem(`tdd_badges_${userId}`) || "{}");
-  const newOnes   = [];
 
-  const checks = {
-    first_drink:    () => stats.totalDrinks >= 1,
-    first_goal:     () => stats.goalsHit >= 1,
-    streak_3:       () => stats.streak >= 3,
-    streak_7:       () => stats.streak >= 7,
-    streak_30:      () => stats.streak >= 30,
-    century:        () => stats.totalDrinks >= 100,
-    perfect_week:   () => stats.perfectWeek,
-    super_hydrated: () => stats.exceededGoal,
+  const saved   = loadBadges(userId);
+  const newOnes = [];
+  const now     = new Date().toISOString();
+
+  const getCount = id => saved[id]?.count || 0;
+
+  // One-time badges — only ever fire once (count = 1)
+  const oneTime = {
+    first_drink: () => stats.totalDrinks >= 1,
+    first_goal:  () => stats.goalsHit    >= 1,
+    streak_3:    () => stats.streak      >= 3,
+    streak_7:    () => stats.streak      >= 7,
+    streak_30:   () => stats.streak      >= 30,
   };
-
-  BADGES.forEach(b => {
-    if (!saved[b.id] && checks[b.id]?.()) {
-      saved[b.id] = new Date().toISOString();
-      newOnes.push(b);
+  Object.entries(oneTime).forEach(([id, check]) => {
+    if (check() && getCount(id) === 0) {
+      saved[id] = { count:1, first:now, last:now };
+      newOnes.push({ ...BADGES.find(b => b.id === id), isFirstUnlock:true, newCount:1 });
     }
   });
 
-  if (newOnes.length) localStorage.setItem(`tdd_badges_${userId}`, JSON.stringify(saved));
-  return { saved, newOnes };
-}
+  // Repeatable badges — target count computed from logs/stats
+  const repeatable = {
+    century:        Math.floor(stats.totalDrinks / 100),
+    perfect_week:   stats.perfectWeeks,
+    super_hydrated: stats.superHydratedDays,
+  };
+  Object.entries(repeatable).forEach(([id, target]) => {
+    if (target <= 0) return;
+    const current = getCount(id);
+    if (target > current) {
+      const first = current === 0 ? now : (saved[id]?.first || now);
+      saved[id] = { count:target, first, last:now };
+      newOnes.push({ ...BADGES.find(b => b.id === id), isFirstUnlock:current === 0, newCount:target });
+    }
+  });
 
-function getBadges(userId) {
-  return JSON.parse(localStorage.getItem(`tdd_badges_${userId}`) || "{}");
+  if (newOnes.length) saveBadgesLocal(userId, saved);
+  return { saved, newOnes: newOnes.filter(Boolean) };
 }
 
 // ── Seasonal theme ────────────────────────────────────────────────────────────
@@ -369,101 +457,37 @@ function WaterTank({ value, max, accentColor, animal, animalColor }) {
   const botY   = TY + TH;
   const animalSz = 86;
   const animalTop = Math.max(TY + 2, wTopY - animalSz * 0.52);
-
-  // Wave paths — tile at period TW=176, covers TX to TX+2.5*TW for seamless scroll
   const wp = (flip) => {
     const amp = flip ? -10 : 10;
     let d = `M${TX},${wTopY}`;
     for (let i = 0; i <= 4; i++) {
-      const x1 = TX + i * TW, x2 = TX + (i + 0.5) * TW, x3 = TX + (i + 1) * TW;
-      d += ` Q${(x1+x2)/2},${wTopY - amp} ${x2},${wTopY} Q${(x2+x3)/2},${wTopY + amp} ${x3},${wTopY}`;
+      const x1=TX+i*TW, x2=TX+(i+0.5)*TW, x3=TX+(i+1)*TW;
+      d += ` Q${(x1+x2)/2},${wTopY-amp} ${x2},${wTopY} Q${(x2+x3)/2},${wTopY+amp} ${x3},${wTopY}`;
     }
-    d += ` L${TX + 5*TW},${botY} L${TX},${botY} Z`;
+    d += ` L${TX+5*TW},${botY} L${TX},${botY} Z`;
     return d;
   };
-
   return (
     <div style={{ position:"relative", width:W, height:H, flexShrink:0 }}>
       <svg width={W} height={H} style={{ position:"absolute", inset:0 }}>
-        <defs>
-          <clipPath id="tClip">
-            <rect x={TX} y={TY} width={TW} height={TH} rx={RX}/>
-          </clipPath>
-        </defs>
-
-        {/* Tank tint */}
+        <defs><clipPath id="tClip"><rect x={TX} y={TY} width={TW} height={TH} rx={RX}/></clipPath></defs>
         <rect x={TX} y={TY} width={TW} height={TH} rx={RX} fill={accentColor} opacity={0.07}/>
-
-        {/* Solid water body */}
-        {waterH > 22 && (
-          <rect x={TX} y={wTopY + 20} width={TW} height={Math.max(0, waterH - 20)}
-            fill={accentColor} opacity={0.28} clipPath="url(#tClip)"/>
-        )}
-
-        {/* Wave 1 — moves left */}
-        {waterH > 0 && (
-          <g clipPath="url(#tClip)">
-            <path d={wp(false)} fill={accentColor} opacity={0.42}
-              style={{ animation:"tankWave1 3s linear infinite" }}/>
-          </g>
-        )}
-
-        {/* Wave 2 — moves right, inverted */}
-        {waterH > 0 && (
-          <g clipPath="url(#tClip)">
-            <path d={wp(true)} fill={accentColor} opacity={0.2}
-              style={{ animation:"tankWave2 4.5s linear infinite" }}/>
-          </g>
-        )}
-
-        {/* Bubbles */}
-        {pct > 0.08 && [
-          { cx:TX+TW*.22, delay:"0s",   dur:"2.8s" },
-          { cx:TX+TW*.58, delay:"1.1s", dur:"3.4s" },
-          { cx:TX+TW*.76, delay:"0.5s", dur:"2.4s" },
-        ].map((b,i) => (
-          <circle key={i} cx={b.cx} cy={wTopY + waterH * (0.3 + i * 0.15)} r={3 + i * 0.5}
-            fill={accentColor} opacity={0.35}
-            style={{ animation:`bubbleRise ${b.dur} ${b.delay} ease-in infinite` }}
-            clipPath="url(#tClip)"/>
+        {waterH>22&&<rect x={TX} y={wTopY+20} width={TW} height={Math.max(0,waterH-20)} fill={accentColor} opacity={0.28} clipPath="url(#tClip)"/>}
+        {waterH>0&&<g clipPath="url(#tClip)"><path d={wp(false)} fill={accentColor} opacity={0.42} style={{animation:"tankWave1 3s linear infinite"}}/></g>}
+        {waterH>0&&<g clipPath="url(#tClip)"><path d={wp(true)} fill={accentColor} opacity={0.2} style={{animation:"tankWave2 4.5s linear infinite"}}/></g>}
+        {pct>0.08&&[{cx:TX+TW*.22,delay:"0s",dur:"2.8s"},{cx:TX+TW*.58,delay:"1.1s",dur:"3.4s"},{cx:TX+TW*.76,delay:"0.5s",dur:"2.4s"}].map((b,i)=>(
+          <circle key={i} cx={b.cx} cy={wTopY+waterH*(0.3+i*0.15)} r={3+i*0.5} fill={accentColor} opacity={0.35} style={{animation:`bubbleRise ${b.dur} ${b.delay} ease-in infinite`}} clipPath="url(#tClip)"/>
         ))}
-
-        {/* Measurement ticks */}
-        {[0.25, 0.5, 0.75].map(lv => {
-          const my = TY + TH - lv * maxH;
-          const on = pct >= lv;
-          return (
-            <g key={lv}>
-              <line x1={TX + TW * 0.72} y1={my} x2={TX + TW - 6} y2={my}
-                stroke={accentColor} strokeWidth={1.5} opacity={on ? 0.55 : 0.18}/>
-              <text x={TX + TW * 0.70} y={my + 4} fontSize={9} fill={accentColor}
-                textAnchor="end" fontFamily="Nunito,sans-serif" fontWeight="700"
-                opacity={on ? 0.65 : 0.2}>
-                {Math.round(lv * 100)}%
-              </text>
-            </g>
-          );
+        {[0.25,0.5,0.75].map(lv=>{
+          const my=TY+TH-lv*maxH, on=pct>=lv;
+          return (<g key={lv}><line x1={TX+TW*.72} y1={my} x2={TX+TW-6} y2={my} stroke={accentColor} strokeWidth={1.5} opacity={on?0.55:0.18}/><text x={TX+TW*.70} y={my+4} fontSize={9} fill={accentColor} textAnchor="end" fontFamily="Nunito,sans-serif" fontWeight="700" opacity={on?0.65:0.2}>{Math.round(lv*100)}%</text></g>);
         })}
-
-        {/* Tank border */}
-        <rect x={TX} y={TY} width={TW} height={TH} rx={RX}
-          fill="none" stroke={accentColor} strokeWidth={2.5} opacity={0.28}/>
-
-        {/* Rivets */}
+        <rect x={TX} y={TY} width={TW} height={TH} rx={RX} fill="none" stroke={accentColor} strokeWidth={2.5} opacity={0.28}/>
         {[[TX+13,TY+13],[TX+TW-13,TY+13],[TX+13,TY+TH-13],[TX+TW-13,TY+TH-13]].map(([bx,by],i)=>(
           <circle key={i} cx={bx} cy={by} r={4.5} fill="none" stroke={accentColor} strokeWidth={1.5} opacity={0.18}/>
         ))}
       </svg>
-
-      {/* Animal — floats above water, transitions smoothly */}
-      <div style={{
-        position:"absolute", left:"50%",
-        top:`${animalTop}px`,
-        transform:"translateX(-50%)",
-        transition:"top 0.9s cubic-bezier(0.4,0,0.2,1)",
-        animation:"float 3.5s ease-in-out infinite",
-        zIndex:2,
-      }}>
+      <div style={{ position:"absolute", left:"50%", top:`${animalTop}px`, transform:"translateX(-50%)", transition:"top 0.9s cubic-bezier(0.4,0,0.2,1)", animation:"float 3.5s ease-in-out infinite", zIndex:2 }}>
         <AnimalFace animal={animal} pct={pct} color={animalColor} size={animalSz}/>
       </div>
     </div>
@@ -540,10 +564,13 @@ function SectionCard({ title, hint, children }) {
 
 // ── Badge screen ──────────────────────────────────────────────────────────────
 function BadgeScreen({ user, logs, onBack }) {
-  const theme   = userTheme(user);
-  const unlocked = getBadges(user.id);
+  const theme    = userTheme(user);
+  const badges   = loadBadges(user.id);
   const stats    = computeStats(user.id, user.goal, logs);
   const dcount   = parseInt(localStorage.getItem(`tdd_dcount_${user.id}`) || "0");
+
+  const unlockedCount = Object.keys(badges).length;
+  const totalTally    = Object.values(badges).reduce((s, b) => s + (b.count || 1), 0);
 
   return (
     <div style={{ minHeight:"100vh", background:theme.light, fontFamily:"'Nunito',sans-serif", maxWidth:430, margin:"0 auto", paddingBottom:48 }}>
@@ -552,7 +579,7 @@ function BadgeScreen({ user, logs, onBack }) {
         <div style={{ textAlign:"center" }}>
           <div style={{ fontWeight:900, fontSize:22 }}>{user.name}'s Badges</div>
           <div style={{ fontSize:12, opacity:0.8, fontWeight:700, marginTop:1 }}>
-            {Object.keys(unlocked).length} of {BADGES.length} unlocked
+            {unlockedCount} of {BADGES.length} types · {totalTally} total
           </div>
         </div>
         <div style={{ width:60 }}/>
@@ -561,14 +588,15 @@ function BadgeScreen({ user, logs, onBack }) {
       {/* Stats strip */}
       <div style={{ display:"flex", gap:10, padding:"20px 20px 0" }}>
         {[
-          { label:"Streak",      val:`${stats.streak}d`,   emoji:"🔥" },
-          { label:"Goals Hit",   val:stats.goalsHit,        emoji:"🎯" },
-          { label:"Total Drinks",val:dcount,                emoji:"💧" },
+          { label:"Streak",        val:`${stats.streak}d`, emoji:"🔥" },
+          { label:"Goals Hit",     val:stats.goalsHit,     emoji:"🎯" },
+          { label:"Total Drinks",  val:dcount,             emoji:"💧" },
+          { label:"Total Badges",  val:totalTally,         emoji:"🏅" },
         ].map((s,i)=>(
-          <div key={i} style={{ flex:1, background:"white", borderRadius:18, padding:"12px 8px", textAlign:"center", boxShadow:"0 4px 16px rgba(0,0,0,0.05)" }}>
-            <div style={{ fontSize:20 }}>{s.emoji}</div>
-            <div style={{ fontWeight:900, fontSize:18, color:theme.dark, marginTop:2 }}>{s.val}</div>
-            <div style={{ fontSize:10, fontWeight:700, color:"#bbb" }}>{s.label}</div>
+          <div key={i} style={{ flex:1, background:"white", borderRadius:18, padding:"10px 6px", textAlign:"center", boxShadow:"0 4px 16px rgba(0,0,0,0.05)" }}>
+            <div style={{ fontSize:18 }}>{s.emoji}</div>
+            <div style={{ fontWeight:900, fontSize:16, color:theme.dark, marginTop:2 }}>{s.val}</div>
+            <div style={{ fontSize:9, fontWeight:700, color:"#bbb" }}>{s.label}</div>
           </div>
         ))}
       </div>
@@ -576,13 +604,42 @@ function BadgeScreen({ user, logs, onBack }) {
       {/* Badge grid */}
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, padding:"16px 20px 0" }}>
         {BADGES.map(badge => {
-          const on  = !!unlocked[badge.id];
-          const dt  = unlocked[badge.id] ? new Date(unlocked[badge.id]).toLocaleDateString("en-GB",{day:"numeric",month:"short"}) : null;
+          const data = badges[badge.id];
+          const on   = !!data;
+          const count = data?.count || 0;
+          const dt   = data?.last ? new Date(data.last).toLocaleDateString("en-GB",{day:"numeric",month:"short"}) : null;
+
           return (
-            <div key={badge.id} style={{ background:on?"white":"rgba(0,0,0,0.04)", borderRadius:22, padding:"20px 16px", textAlign:"center", opacity:on?1:0.45, boxShadow:on?"0 4px 18px rgba(0,0,0,0.07)":"none", border:on?`2px solid ${theme.accent}28`:"2px solid transparent", transition:"all 0.2s" }}>
-              <div style={{ fontSize:38, marginBottom:8, filter:on?"none":"grayscale(1)" }}>{badge.emoji}</div>
+            <div key={badge.id} style={{ background:on?"white":"rgba(0,0,0,0.04)", borderRadius:22, padding:"20px 16px", textAlign:"center", opacity:on?1:0.42, boxShadow:on?"0 4px 18px rgba(0,0,0,0.07)":"none", border:on?`2px solid ${theme.accent}28`:"2px solid transparent", transition:"all 0.2s", position:"relative" }}>
+
+              {/* Count badge for repeatable badges earned more than once */}
+              {on && badge.repeatable && count > 1 && (
+                <div style={{ position:"absolute", top:10, right:12, background:theme.accent, color:"white", borderRadius:20, padding:"3px 9px", fontSize:12, fontWeight:900 }}>
+                  ×{count}
+                </div>
+              )}
+
+              <div style={{ fontSize:36, marginBottom:8, filter:on?"none":"grayscale(1)" }}>{badge.emoji}</div>
               <div style={{ fontWeight:900, fontSize:13, color:theme.dark, marginBottom:4 }}>{badge.label}</div>
-              <div style={{ fontSize:11, color:"#bbb", fontWeight:600 }}>{on ? `✓ ${dt}` : badge.desc}</div>
+
+              {on ? (
+                <div style={{ fontSize:11, color:theme.accent, fontWeight:700 }}>
+                  {badge.repeatable && count > 1
+                    ? `${count}× · Last ${dt}`
+                    : `✓ ${dt}`}
+                </div>
+              ) : (
+                <div style={{ fontSize:11, color:"#bbb", fontWeight:600 }}>{badge.desc}</div>
+              )}
+
+              {/* For repeatable badges, show a small progress hint when unlocked */}
+              {on && badge.repeatable && (
+                <div style={{ fontSize:10, color:"#ccc", marginTop:3, fontWeight:600 }}>
+                  {badge.id === "century"        && `${dcount} drinks total`}
+                  {badge.id === "perfect_week"   && `${stats.perfectWeeks} perfect weeks`}
+                  {badge.id === "super_hydrated" && `${stats.superHydratedDays} days`}
+                </div>
+              )}
             </div>
           );
         })}
@@ -598,16 +655,13 @@ function SettingsScreen({ user, onSave, onBack }) {
   const [name,setName]     = useState(user.name);
   const [themeId,setTheme] = useState(user.themeId||"teal");
   const [colorId,setColor] = useState(user.animalColorId||"mint");
-
   const presets = [800,1000,1200,1400,1600,1800,2000,2500];
   const pt = resolveTheme(themeId);
   const pac = resolveAnimal(colorId).color;
-
   const handleSave = () => {
     const g = parseInt(goal);
     if (g >= 200 && g <= 5000) onSave({ ...user, goal:g, animal, name:name.trim()||user.name, themeId, animalColorId:colorId });
   };
-
   return (
     <div style={{ minHeight:"100vh", background:pt.light, fontFamily:"'Nunito',sans-serif", maxWidth:430, margin:"0 auto", paddingBottom:56 }}>
       <div style={{ background:pt.accent, borderRadius:"0 0 36px 36px", padding:"20px 20px 30px", color:"white", display:"flex", alignItems:"center", justifyContent:"space-between", boxShadow:`0 8px 30px ${pt.accent}55` }}>
@@ -615,17 +669,14 @@ function SettingsScreen({ user, onSave, onBack }) {
         <div style={{ fontWeight:900, fontSize:22 }}>⚙️ Settings</div>
         <button onClick={handleSave} style={{ background:"rgba(255,255,255,0.25)", border:"none", borderRadius:14, padding:"8px 16px", color:"white", fontSize:13, fontWeight:800, cursor:"pointer", fontFamily:"'Nunito',sans-serif" }}>Save ✓</button>
       </div>
-
       <div style={{ padding:"24px 20px 0" }}>
         <SectionCard title="NAME">
           <input value={name} onChange={e=>setName(e.target.value)} style={{ width:"100%", border:`2px solid ${pt.accent}44`, borderRadius:14, padding:"12px 16px", fontSize:18, fontWeight:800, color:"#333", fontFamily:"'Nunito',sans-serif", outline:"none", boxSizing:"border-box", background:pt.light }}/>
         </SectionCard>
-
         <SectionCard title="THEME COLOUR" hint="Header, ring and background colour">
           <SwatchGrid items={THEME_COLOURS} selected={themeId} onSelect={setTheme} cols={5}
             renderSwatch={item=><div style={{ width:32, height:32, borderRadius:10, background:item.accent, boxShadow:`0 3px 8px ${item.accent}55` }}/>}/>
         </SectionCard>
-
         <SectionCard title="PET ANIMAL">
           <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:8, marginBottom:16 }}>
             {ANIMALS.map(a=>{
@@ -648,7 +699,6 @@ function SettingsScreen({ user, onSave, onBack }) {
             </div>
           </div>
         </SectionCard>
-
         <SectionCard title="DAILY WATER GOAL" hint="Recommended: 9–11 yr ≈ 1400–1800ml/day">
           <div style={{ display:"flex", flexWrap:"wrap", gap:8, marginBottom:14 }}>
             {presets.map(p=>(
@@ -664,7 +714,6 @@ function SettingsScreen({ user, onSave, onBack }) {
             <span style={{ fontWeight:800, color:"#bbb", fontSize:16 }}>ml</span>
           </div>
         </SectionCard>
-
         <button onClick={handleSave}
           style={{ width:"100%", background:pt.accent, border:"none", borderRadius:22, padding:"18px", color:"white", fontSize:18, fontWeight:900, cursor:"pointer", fontFamily:"'Nunito',sans-serif", boxShadow:`0 6px 24px ${pt.accent}55` }}>
           Save Changes ✓
@@ -674,20 +723,14 @@ function SettingsScreen({ user, onSave, onBack }) {
   );
 }
 
-// ── Select screen — minimal branding, prominent cards ─────────────────────────
+// ── Select screen ─────────────────────────────────────────────────────────────
 function SelectScreen({ users, logs, onSelect, onSettings }) {
   const season = getSeasonalTheme();
   return (
     <div style={{ minHeight:"100vh", background:`linear-gradient(160deg,${season.bg[0]} 0%,${season.bg[1]} 55%,${season.bg[2]} 100%)`, display:"flex", flexDirection:"column", fontFamily:"'Nunito',sans-serif", position:"relative", overflow:"hidden" }}>
-
-      {/* Floating seasonal decorations */}
       {season.emojis.map((e,i)=>(
-        <div key={i} style={{ position:"absolute", fontSize:26, opacity:0.13, top:`${[12,22,68,78,42][i]}%`, left:`${[4,82,6,78,48][i]}%`, animation:`float ${2.5+i*0.4}s ease-in-out infinite`, animationDelay:`${i*0.5}s`, pointerEvents:"none" }}>
-          {e}
-        </div>
+        <div key={i} style={{ position:"absolute", fontSize:26, opacity:0.13, top:`${[12,22,68,78,42][i]}%`, left:`${[4,82,6,78,48][i]}%`, animation:`float ${2.5+i*0.4}s ease-in-out infinite`, animationDelay:`${i*0.5}s`, pointerEvents:"none" }}>{e}</div>
       ))}
-
-      {/* Small top bar */}
       <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"20px 22px 8px" }}>
         <div style={{ display:"flex", alignItems:"center", gap:7 }}>
           <span style={{ fontSize:18 }}>💧</span>
@@ -695,48 +738,39 @@ function SelectScreen({ users, logs, onSelect, onSettings }) {
         </div>
         <span style={{ fontSize:11, color:"rgba(255,255,255,0.3)", fontWeight:700 }}>{season.label}</span>
       </div>
-
-      {/* Cards */}
       <div style={{ flex:1, display:"flex", flexDirection:"column", justifyContent:"center", padding:"12px 18px 28px" }}>
-        <p style={{ color:"rgba(255,255,255,0.4)", fontSize:13, fontWeight:700, margin:"0 0 18px", textAlign:"center", letterSpacing:0.5 }}>
-          Who's drinking today?
-        </p>
-
+        <p style={{ color:"rgba(255,255,255,0.4)", fontSize:13, fontWeight:700, margin:"0 0 18px", textAlign:"center", letterSpacing:0.5 }}>Who's drinking today?</p>
         {users.map((u,idx)=>{
           const theme=userTheme(u), aColor=userAColor(u);
           const intake=logs[`${u.id}-${today()}`]||0;
           const pct=Math.min(intake/u.goal,1);
           const pctRound=Math.round(pct*100);
           const animalInfo=ANIMALS.find(a=>a.id===(u.animal||"cat"));
-          const badgeCount=Object.keys(getBadges(u.id)).length;
-
+          const badges=loadBadges(u.id);
+          const badgeCount=Object.keys(badges).length;
+          const badgeTally=Object.values(badges).reduce((s,b)=>s+(b.count||1),0);
           return (
             <div key={u.id} style={{ marginBottom:idx<users.length-1?16:0, animation:`pop 0.4s ease ${idx*0.12}s both`, position:"relative" }}>
               <div onClick={()=>onSelect(u)}
                 style={{ background:"rgba(255,255,255,0.09)", border:"1.5px solid rgba(255,255,255,0.13)", backdropFilter:"blur(16px)", borderRadius:32, padding:"22px 20px", cursor:"pointer", display:"flex", alignItems:"center", gap:18 }}
                 onMouseDown={e=>e.currentTarget.style.transform="scale(0.97)"} onMouseUp={e=>e.currentTarget.style.transform="scale(1)"}
                 onTouchStart={e=>e.currentTarget.style.transform="scale(0.97)"} onTouchEnd={e=>e.currentTarget.style.transform="scale(1)"}>
-
-                {/* Big animal avatar */}
                 <div style={{ width:80, height:80, borderRadius:"50%", background:theme.light, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0, border:`3px solid ${theme.accent}55`, boxShadow:`0 0 22px ${theme.accent}33` }}>
                   <AnimalFace animal={u.animal||"cat"} pct={intake/u.goal} color={aColor} size={66}/>
                 </div>
-
                 <div style={{ flex:1, minWidth:0 }}>
                   <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:6 }}>
                     <div style={{ fontWeight:900, fontSize:24, color:"white", letterSpacing:-0.5 }}>{u.name}</div>
                     <div style={{ fontSize:18 }}>{animalInfo?.emoji}</div>
-                    {badgeCount > 0 && (
+                    {badgeTally > 0 && (
                       <div style={{ background:"rgba(255,215,0,0.22)", border:"1px solid rgba(255,215,0,0.38)", borderRadius:10, padding:"2px 8px", fontSize:11, fontWeight:800, color:"rgba(255,215,0,0.9)" }}>
-                        🏅 {badgeCount}
+                        🏅 {badgeTally}
                       </div>
                     )}
                   </div>
-
                   <div style={{ height:8, background:"rgba(255,255,255,0.12)", borderRadius:4, marginBottom:8, overflow:"hidden" }}>
                     <div style={{ height:8, borderRadius:4, background:pct>=1?"#4CAF85":theme.accent, width:`${pctRound}%`, transition:"width 0.5s ease", boxShadow:`0 0 8px ${pct>=1?"#4CAF8588":theme.accent+"88"}` }}/>
                   </div>
-
                   <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
                     <div style={{ fontSize:13, color:"rgba(255,255,255,0.45)", fontWeight:700 }}>
                       {intake}ml <span style={{ opacity:0.5 }}>/ {u.goal}ml</span>
@@ -747,7 +781,6 @@ function SelectScreen({ users, logs, onSelect, onSettings }) {
                   </div>
                 </div>
               </div>
-
               <button onClick={e=>{e.stopPropagation();onSettings(u);}}
                 style={{ position:"absolute", top:-6, right:-6, width:36, height:36, borderRadius:"50%", background:"rgba(255,255,255,0.14)", border:"1.5px solid rgba(255,255,255,0.25)", color:"white", fontSize:15, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", backdropFilter:"blur(8px)" }}>
                 ⚙️
@@ -756,10 +789,7 @@ function SelectScreen({ users, logs, onSelect, onSettings }) {
           );
         })}
       </div>
-
-      <p style={{ color:"rgba(255,255,255,0.14)", fontSize:11, textAlign:"center", margin:"0 0 16px", fontWeight:600 }}>
-        ☁️ Cloud sync enabled
-      </p>
+      <p style={{ color:"rgba(255,255,255,0.14)", fontSize:11, textAlign:"center", margin:"0 0 16px", fontWeight:600 }}>☁️ Cloud sync enabled</p>
     </div>
   );
 }
@@ -788,6 +818,8 @@ export default function TheDailyDrink() {
         setLogs(localLogs);
         setUsers(localUsers);
         setSyncing(true);
+
+        // Sync logs, profiles, and badges for all users in parallel
         const [mLogs, mUsers] = await Promise.all([
           fetchAndMergeLogs(localLogs),
           fetchAndMergeProfiles(localUsers),
@@ -795,6 +827,14 @@ export default function TheDailyDrink() {
         persistLogs(mLogs);
         persistUsers(mUsers);
         syncAll(mLogs);
+
+        // Sync badges per user
+        await Promise.all(DEFAULT_USERS.map(async u => {
+          const local  = loadBadges(u.id);
+          const merged = await fetchAndMergeBadges(local, u.id);
+          saveBadgesLocal(u.id, merged);
+        }));
+
       } catch(e) { console.warn("init:", e); }
       finally { setSyncing(false); }
     };
@@ -807,20 +847,23 @@ export default function TheDailyDrink() {
     persistLogs({ ...logs, [key]:next });
     syncLog(user.id, today(), next);
 
-    // Drink counter
     const dc = parseInt(localStorage.getItem(`tdd_dcount_${user.id}`) || "0") + 1;
     localStorage.setItem(`tdd_dcount_${user.id}`, String(dc));
 
     playSound("splash");
-
     setJustAdded(`+${ml}ml`);
     setTimeout(()=>setJustAdded(null), 1400);
 
-    const { newOnes } = checkBadges(user.id, user.goal, { ...logs, [key]:next });
+    const { saved, newOnes } = checkBadges(user.id, user.goal, { ...logs, [key]:next });
     if (newOnes.length) {
       playSound("badge");
       setNewBadge(newOnes[0]);
       setTimeout(()=>setNewBadge(null), 3000);
+      // Sync each updated badge to Sheets
+      newOnes.forEach(b => {
+        const bd = saved[b.id];
+        if (bd) syncBadge(user.id, b.id, bd.count, bd.first, bd.last);
+      });
     }
 
     if (next >= user.goal && prev < user.goal) {
@@ -885,7 +928,6 @@ export default function TheDailyDrink() {
     <><style>{CSS}</style><BadgeScreen user={user} logs={logs} onBack={()=>setScreen("main")}/></>
   );
 
-  // ── Main hydration screen ──
   const cu          = users.find(u=>u.id===user.id)||user;
   const theme       = userTheme(cu);
   const aColor      = userAColor(cu);
@@ -898,13 +940,13 @@ export default function TheDailyDrink() {
                     : hydPct>=.4  ? { text:"Good progress 👍",        sub:`${remaining}ml remaining` }
                                   : { text:"Thirsty! Please drink 😰", sub:`${remaining}ml to go` };
   const animalLabel = ANIMALS.find(a=>a.id===(cu.animal||"cat"));
-  const badgeCount  = Object.keys(getBadges(cu.id)).length;
+  const curBadges   = loadBadges(cu.id);
+  const badgeTally  = Object.values(curBadges).reduce((s,b)=>s+(b.count||1),0);
 
   return (
     <div style={{ minHeight:"100vh", background:theme.light, fontFamily:"'Nunito',sans-serif", maxWidth:430, margin:"0 auto", paddingBottom:40, position:"relative", overflow:"hidden" }}>
       <style>{CSS}</style>
 
-      {/* Header */}
       <div style={{ background:theme.accent, borderRadius:"0 0 36px 36px", padding:"20px 20px 28px", color:"white", display:"flex", alignItems:"center", justifyContent:"space-between", boxShadow:`0 8px 30px ${theme.accent}55` }}>
         <button onClick={()=>setScreen("select")} style={{ background:"rgba(255,255,255,0.18)", border:"none", borderRadius:14, padding:"8px 16px", color:"white", fontSize:13, fontWeight:800, cursor:"pointer", fontFamily:"'Nunito',sans-serif" }}>← Back</button>
         <div style={{ textAlign:"center" }}>
@@ -915,16 +957,14 @@ export default function TheDailyDrink() {
           <button onClick={undoLast} style={{ background:"rgba(255,255,255,0.18)", border:"none", borderRadius:14, padding:"8px 12px", color:"white", fontSize:13, fontWeight:800, cursor:"pointer", fontFamily:"'Nunito',sans-serif" }}>↩</button>
           <button onClick={()=>setScreen("badges")} style={{ background:"rgba(255,255,255,0.18)", border:"none", borderRadius:14, padding:"8px 10px", color:"white", fontSize:14, cursor:"pointer", position:"relative" }}>
             🏅
-            {badgeCount>0&&<div style={{ position:"absolute", top:-4, right:-4, background:"#FFD700", borderRadius:"50%", width:16, height:16, fontSize:9, fontWeight:900, color:"#333", display:"flex", alignItems:"center", justifyContent:"center" }}>{badgeCount}</div>}
+            {badgeTally>0&&<div style={{ position:"absolute", top:-4, right:-4, background:"#FFD700", borderRadius:"50%", width:18, height:18, fontSize:9, fontWeight:900, color:"#333", display:"flex", alignItems:"center", justifyContent:"center" }}>{badgeTally}</div>}
           </button>
           <button onClick={()=>setScreen("settings")} style={{ background:"rgba(255,255,255,0.18)", border:"none", borderRadius:14, padding:"8px 10px", color:"white", fontSize:14, cursor:"pointer" }}>⚙️</button>
         </div>
       </div>
 
-      {/* Water tank */}
       <div style={{ display:"flex", flexDirection:"column", alignItems:"center", padding:"22px 24px 4px" }}>
         <WaterTank value={intake} max={cu.goal} accentColor={theme.accent} lightColor={theme.light} animal={cu.animal||"cat"} animalColor={aColor}/>
-
         <div style={{ textAlign:"center", marginTop:8 }}>
           <div style={{ fontSize:38, fontWeight:900, color:theme.dark, lineHeight:1, letterSpacing:-1 }}>
             {intake}<span style={{ fontSize:17, fontWeight:700, color:"#bbb", marginLeft:3 }}>ml</span>
@@ -937,7 +977,6 @@ export default function TheDailyDrink() {
         </div>
       </div>
 
-      {/* Drink buttons */}
       <div style={{ padding:"16px 20px 0" }}>
         <div style={{ fontSize:11, fontWeight:800, letterSpacing:1.5, color:"#bbb", marginBottom:10 }}>ADD A DRINK</div>
         <div style={{ display:"flex", gap:10 }}>
@@ -954,7 +993,6 @@ export default function TheDailyDrink() {
         <CustomDrink color={theme.accent} light={theme.light} onAdd={addDrink}/>
       </div>
 
-      {/* Week chart */}
       <div style={{ padding:"16px 20px 0" }}>
         <div style={{ background:"white", borderRadius:24, padding:"16px 16px 12px", boxShadow:"0 4px 20px rgba(0,0,0,0.05)" }}>
           <div style={{ fontSize:11, fontWeight:800, letterSpacing:1.5, color:"#bbb", marginBottom:12 }}>THIS WEEK</div>
@@ -962,21 +1000,20 @@ export default function TheDailyDrink() {
         </div>
       </div>
 
-      {/* Drink toast */}
       {justAdded&&<div style={{ position:"fixed", bottom:100, left:"50%", transform:"translateX(-50%)", background:theme.accent, color:"white", fontWeight:900, fontSize:18, borderRadius:20, padding:"10px 28px", animation:"toastUp 1.4s ease forwards", pointerEvents:"none", zIndex:50 }}>{justAdded} 💧</div>}
 
-      {/* Badge unlock toast */}
       {newBadge&&(
         <div style={{ position:"fixed", bottom:140, left:"50%", transform:"translateX(-50%)", background:"#1a1a2e", color:"white", borderRadius:24, padding:"14px 22px", zIndex:60, animation:"badgePop 0.4s ease", display:"flex", alignItems:"center", gap:12, boxShadow:"0 8px 32px rgba(0,0,0,0.4)", pointerEvents:"none", whiteSpace:"nowrap" }}>
           <span style={{ fontSize:30 }}>{newBadge.emoji}</span>
           <div>
-            <div style={{ fontSize:11, fontWeight:700, color:"#FFD700", letterSpacing:1 }}>BADGE UNLOCKED</div>
+            <div style={{ fontSize:11, fontWeight:700, color:"#FFD700", letterSpacing:1 }}>
+              {newBadge.isFirstUnlock ? "BADGE UNLOCKED" : `BADGE ×${newBadge.newCount}`}
+            </div>
             <div style={{ fontSize:15, fontWeight:900 }}>{newBadge.label}</div>
           </div>
         </div>
       )}
 
-      {/* Goal celebration */}
       {celebrating&&<div onClick={()=>setCelebrating(false)} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.55)", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", zIndex:100, cursor:"pointer", animation:"fadeUp 0.3s ease" }}>
         <div style={{ animation:"celebrate 0.5s ease", textAlign:"center" }}>
           <div style={{ fontSize:90 }}>🎉</div>
