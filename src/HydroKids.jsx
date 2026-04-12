@@ -72,22 +72,29 @@ async function fetchAndMergeProfiles(localUsers) {
   } catch(e) { return localUsers; }
 }
 
-// Fetch badges for one user from Sheets and merge with local.
-// Remote wins if its count is higher — never decreases a tally.
-async function fetchAndMergeBadges(localBadges, userId) {
+// Sync strategy for badges:
+// 1. Push every local badge up to Sheets (so nothing earned offline is lost)
+// 2. Fetch the full badge state from Sheets
+// 3. Use Sheets as the single source of truth — replace local entirely
+// Fallback: if the fetch fails (offline), keep local unchanged.
+async function pushThenFetchBadges(localBadges, userId) {
   if (!APPS_SCRIPT_URL) return localBadges;
   try {
+    // Step 1 — push all local badges up to Sheets in parallel (fire-and-forget)
+    await Promise.all(
+      Object.entries(localBadges).map(([id, b]) =>
+        syncBadge(userId, id, b.count || 1, b.first || b, b.last || b)
+      )
+    );
+    // Step 2 — fetch the authoritative state from Sheets
     const res = await fetch(APPS_SCRIPT_URL + `?action=badges&userId=${userId}`);
     const j   = await res.json();
     if (j.status !== "ok") return localBadges;
-    const remote = j.data.badges; // { badgeId: { count, first, last } }
-    const merged = { ...localBadges };
-    Object.entries(remote).forEach(([id, rb]) => {
-      const lb = merged[id];
-      if (!lb || rb.count > lb.count) merged[id] = rb;
-    });
-    return merged;
-  } catch(e) { return localBadges; }
+    // Step 3 — Sheets wins completely; return remote as the new local state
+    return j.data.badges; // { badgeId: { count, first, last } }
+  } catch(e) {
+    return localBadges; // offline — keep local, will re-sync next open
+  }
 }
 
 // ── Sound effects ─────────────────────────────────────────────────────────────
@@ -828,11 +835,11 @@ export default function TheDailyDrink() {
         persistUsers(mUsers);
         syncAll(mLogs);
 
-        // Sync badges per user
+        // Badge sync: push local up first, then use Sheets as truth
         await Promise.all(DEFAULT_USERS.map(async u => {
-          const local  = loadBadges(u.id);
-          const merged = await fetchAndMergeBadges(local, u.id);
-          saveBadgesLocal(u.id, merged);
+          const local      = loadBadges(u.id);
+          const authoritative = await pushThenFetchBadges(local, u.id);
+          saveBadgesLocal(u.id, authoritative);
         }));
 
       } catch(e) { console.warn("init:", e); }
