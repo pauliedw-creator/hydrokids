@@ -48,6 +48,29 @@ async function syncBadge(userId, badgeId, count, firstEarned, lastEarned) {
   } catch(e) { console.warn("syncBadge:", e); }
 }
 
+// Push the full items array for a user/date to Sheets (replaces any existing row)
+async function syncItems(userId, date, items) {
+  if (!APPS_SCRIPT_URL) return;
+  try {
+    await fetch(APPS_SCRIPT_URL + "?action=items", {
+      method:"POST", mode:"no-cors",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({ userId, date, items }),
+    });
+  } catch(e) { console.warn("syncItems:", e); }
+}
+
+// Fetch today's items from Sheets and replace local — Sheets is source of truth
+async function fetchAndReplaceItems(userId, date) {
+  if (!APPS_SCRIPT_URL) return null;
+  try {
+    const res = await fetch(APPS_SCRIPT_URL + `?action=items&userId=${userId}&date=${date}`);
+    const j   = await res.json();
+    if (j.status !== "ok") return null;
+    return j.data.items; // array of { ml, time, emoji, label }
+  } catch(e) { return null; }
+}
+
 async function fetchAndMergeLogs(local) {
   if (!APPS_SCRIPT_URL) return local;
   try {
@@ -95,6 +118,26 @@ async function pushThenFetchBadges(localBadges, userId) {
   } catch(e) {
     return localBadges; // offline — keep local, will re-sync next open
   }
+}
+
+// ── Drink item log (localStorage only, per user per day) ─────────────────────
+// Each item: { ml, time: ISO string, emoji }
+function itemKey(userId, date) { return `tdd_items_${userId}_${date}`; }
+
+function loadItems(userId, date) {
+  try { return JSON.parse(localStorage.getItem(itemKey(userId, date)) || "[]"); }
+  catch { return []; }
+}
+
+function saveItems(userId, date, items) {
+  try { localStorage.setItem(itemKey(userId, date), JSON.stringify(items)); }
+  catch {}
+}
+
+function drinkEmoji(ml) {
+  if (ml <= 100) return "💧";
+  if (ml <= 300) return "🥛";
+  return "🍶";
 }
 
 // ── Sound effects ─────────────────────────────────────────────────────────────
@@ -520,22 +563,31 @@ function SwatchGrid({ items, selected, onSelect, renderSwatch, cols=5 }) {
   );
 }
 
-function WeekChart({ userId, goal, color, logs }) {
+function WeekChart({ userId, goal, color, logs, onSelectDay }) {
   const days = [...Array(7)].map((_,i)=>{
     const d=new Date(); d.setDate(d.getDate()-(6-i));
-    const key=`${userId}-${d.toISOString().split("T")[0]}`;
-    return { label:d.toLocaleDateString("en-GB",{weekday:"short"}), val:logs[key]||0, isToday:i===6 };
+    const dateStr = d.toISOString().split("T")[0];
+    const key=`${userId}-${dateStr}`;
+    return { label:d.toLocaleDateString("en-GB",{weekday:"short"}), val:logs[key]||0, isToday:i===6, date:dateStr };
   });
   return (
-    <div style={{ display:"flex", alignItems:"flex-end", gap:6, height:64, padding:"0 4px" }}>
+    <div style={{ display:"flex", alignItems:"flex-end", gap:6, height:72, padding:"0 4px" }}>
       {days.map((d,i)=>{
         const pct=Math.min(d.val/goal,1);
+        const hasDrinks = d.val > 0;
         return (
-          <div key={i} style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", gap:4 }}>
-            <div style={{ width:"100%", height:44, borderRadius:8, background:"#f0f0f0", position:"relative", overflow:"hidden" }}>
+          <div key={i} onClick={()=>hasDrinks && onSelectDay(d.date)}
+            style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", gap:4, cursor:hasDrinks?"pointer":"default" }}>
+            <div style={{ width:"100%", height:44, borderRadius:8, background:"#f0f0f0", position:"relative", overflow:"hidden",
+              transition:"transform 0.1s", transform:"scale(1)" }}
+              onMouseDown={e=>{ if(hasDrinks) e.currentTarget.style.transform="scale(0.92)"; }}
+              onMouseUp={e=>e.currentTarget.style.transform="scale(1)"}
+              onTouchStart={e=>{ if(hasDrinks) e.currentTarget.style.transform="scale(0.92)"; }}
+              onTouchEnd={e=>e.currentTarget.style.transform="scale(1)"}>
               <div style={{ position:"absolute", bottom:0, width:"100%", height:`${pct*100}%`, background:pct>=1?"#4CAF85":color, borderRadius:"6px 6px 0 0", transition:"height 0.4s ease" }}/>
             </div>
             <div style={{ fontSize:10, fontWeight:d.isToday?800:600, color:d.isToday?color:"#bbb" }}>{d.label}</div>
+            {hasDrinks && <div style={{ width:4, height:4, borderRadius:"50%", background:color, opacity:0.5 }}/>}
           </div>
         );
       })}
@@ -566,6 +618,140 @@ function SectionCard({ title, hint, children }) {
       {hint&&<div style={{ fontSize:11, color:"#ccc", fontWeight:600, marginBottom:12 }}>{hint}</div>}
       {children}
     </div>
+  );
+}
+
+// ── Drink log ─────────────────────────────────────────────────────────────────
+function DrinkLog({ userId, date, color, dark, onDelete }) {
+  const items = loadItems(userId, date);
+  if (items.length === 0) return (
+    <div style={{ background:"white", borderRadius:24, padding:"16px 18px", boxShadow:"0 4px 20px rgba(0,0,0,0.05)" }}>
+      <div style={{ fontSize:11, fontWeight:800, letterSpacing:1.5, color:"#bbb", marginBottom:10 }}>TODAY'S DRINKS</div>
+      <div style={{ fontSize:13, color:"#ccc", fontWeight:600, textAlign:"center", padding:"12px 0" }}>No drinks logged yet</div>
+    </div>
+  );
+
+  const fmt = iso => {
+    const d = new Date(iso);
+    return d.toLocaleTimeString("en-GB", { hour:"2-digit", minute:"2-digit" });
+  };
+
+  return (
+    <div style={{ background:"white", borderRadius:24, padding:"16px 18px", boxShadow:"0 4px 20px rgba(0,0,0,0.05)" }}>
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:12 }}>
+        <div style={{ fontSize:11, fontWeight:800, letterSpacing:1.5, color:"#bbb" }}>TODAY'S DRINKS</div>
+        <div style={{ fontSize:11, fontWeight:800, color:color }}>
+          {items.reduce((s,i)=>s+i.ml,0)}ml total
+        </div>
+      </div>
+      <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+        {[...items].reverse().map((item, idx) => (
+          <div key={idx} style={{ display:"flex", alignItems:"center", gap:10, padding:"8px 10px", background:"#fafafa", borderRadius:14 }}>
+            <div style={{ fontSize:20, width:28, textAlign:"center" }}>{item.emoji}</div>
+            <div style={{ flex:1 }}>
+              <span style={{ fontWeight:800, fontSize:14, color:dark }}>{item.ml}ml</span>
+              {item.label && <span style={{ fontSize:12, color:"#bbb", fontWeight:600, marginLeft:6 }}>{item.label}</span>}
+            </div>
+            <div style={{ fontSize:12, fontWeight:700, color:"#bbb", minWidth:38, textAlign:"right" }}>{fmt(item.time)}</div>
+            {/* Only allow deleting the most recent item (index 0 of reversed = last item) */}
+            {idx === 0 && (
+              <button onClick={()=>onDelete()} style={{ background:"none", border:"none", color:"#ddd", fontSize:16, cursor:"pointer", padding:"0 2px", lineHeight:1 }}>✕</button>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Day history panel ─────────────────────────────────────────────────────────
+async function fetchItemsForDate(userId, date) {
+  if (!APPS_SCRIPT_URL) return null;
+  try {
+    const res = await fetch(APPS_SCRIPT_URL + `?action=items&userId=${userId}&date=${date}`);
+    const j   = await res.json();
+    if (j.status !== "ok") return null;
+    return j.data.items;
+  } catch(e) { return null; }
+}
+
+function DayHistoryPanel({ userId, date, goal, color, dark, accent, onClose }) {
+  const [items, setItems]     = useState(null); // null = loading
+  const [total, setTotal]     = useState(0);
+
+  useEffect(()=>{
+    // Try local first for instant display
+    const local = loadItems(userId, date);
+    setItems(local);
+    setTotal(local.reduce((s,i)=>s+i.ml, 0));
+
+    // Then fetch from Sheets and replace if different
+    fetchItemsForDate(userId, date).then(remote => {
+      if (remote !== null) {
+        saveItems(userId, date, remote);
+        setItems(remote);
+        setTotal(remote.reduce((s,i)=>s+i.ml, 0));
+      }
+    });
+  }, [userId, date]);
+
+  const fmt = iso => new Date(iso).toLocaleTimeString("en-GB",{ hour:"2-digit", minute:"2-digit" });
+  const friendlyDate = new Date(date + "T12:00:00").toLocaleDateString("en-GB",{ weekday:"long", day:"numeric", month:"long" });
+  const pct = Math.round(Math.min(total / goal, 1) * 100);
+
+  return (
+    <>
+      {/* Backdrop */}
+      <div onClick={onClose} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.4)", zIndex:80, animation:"fadeUp 0.2s ease" }}/>
+
+      {/* Panel */}
+      <div style={{ position:"fixed", bottom:0, left:"50%", transform:"translateX(-50%)", width:"100%", maxWidth:430, background:"white", borderRadius:"28px 28px 0 0", zIndex:90, padding:"0 0 40px", boxShadow:"0 -8px 40px rgba(0,0,0,0.18)", animation:"slideUp 0.28s cubic-bezier(0.4,0,0.2,1)" }}>
+
+        {/* Handle */}
+        <div style={{ display:"flex", justifyContent:"center", padding:"12px 0 4px" }}>
+          <div style={{ width:36, height:4, borderRadius:2, background:"#e0e0e0" }}/>
+        </div>
+
+        {/* Header */}
+        <div style={{ padding:"8px 20px 16px", borderBottom:"1px solid #f0f0f0" }}>
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+            <div>
+              <div style={{ fontWeight:900, fontSize:17, color:"#333" }}>{friendlyDate}</div>
+              <div style={{ fontSize:13, color:"#bbb", fontWeight:600, marginTop:2 }}>
+                {total}ml · {pct}% of goal
+              </div>
+            </div>
+            <button onClick={onClose} style={{ background:"#f5f5f5", border:"none", borderRadius:"50%", width:32, height:32, fontSize:16, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", color:"#999" }}>✕</button>
+          </div>
+          {/* Mini progress bar */}
+          <div style={{ height:6, background:"#f0f0f0", borderRadius:3, marginTop:12, overflow:"hidden" }}>
+            <div style={{ height:6, borderRadius:3, background:pct>=100?"#4CAF85":accent, width:`${pct}%`, transition:"width 0.4s ease" }}/>
+          </div>
+        </div>
+
+        {/* Items list */}
+        <div style={{ padding:"12px 20px 0", maxHeight:320, overflowY:"auto" }}>
+          {items === null ? (
+            <div style={{ textAlign:"center", padding:"32px 0", color:"#bbb", fontSize:13, fontWeight:600 }}>Loading…</div>
+          ) : items.length === 0 ? (
+            <div style={{ textAlign:"center", padding:"32px 0", color:"#bbb", fontSize:13, fontWeight:600 }}>No drinks recorded for this day</div>
+          ) : (
+            <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+              {[...items].reverse().map((item, idx) => (
+                <div key={idx} style={{ display:"flex", alignItems:"center", gap:12, padding:"10px 12px", background:"#fafafa", borderRadius:14 }}>
+                  <div style={{ fontSize:22, width:30, textAlign:"center" }}>{item.emoji}</div>
+                  <div style={{ flex:1 }}>
+                    <span style={{ fontWeight:800, fontSize:15, color:"#333" }}>{item.ml}ml</span>
+                    {item.label && <span style={{ fontSize:12, color:"#bbb", fontWeight:600, marginLeft:6 }}>{item.label}</span>}
+                  </div>
+                  <div style={{ fontSize:13, fontWeight:700, color:"#bbb" }}>{fmt(item.time)}</div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </>
   );
 }
 
@@ -811,6 +997,8 @@ export default function TheDailyDrink() {
   const [justAdded,setJustAdded]     = useState(null);
   const [syncing,setSyncing]         = useState(false);
   const [newBadge,setNewBadge]       = useState(null);
+  const [itemTick,setItemTick]       = useState(0);
+  const [selectedDay,setSelectedDay] = useState(null); // date string or null
 
   const persistLogs  = useCallback(nl=>{setLogs(nl);  try{localStorage.setItem("hydrokids_logs",JSON.stringify(nl));}catch{}}, []);
   const persistUsers = useCallback(nu=>{setUsers(nu); try{localStorage.setItem("hydrokids_users",JSON.stringify(nu));}catch{}}, []);
@@ -842,17 +1030,37 @@ export default function TheDailyDrink() {
           saveBadgesLocal(u.id, authoritative);
         }));
 
+        // Item sync: fetch today's items from Sheets — Sheets wins
+        const todayStr = today();
+        await Promise.all(DEFAULT_USERS.map(async u => {
+          const remote = await fetchAndReplaceItems(u.id, todayStr);
+          if (remote !== null) {
+            saveItems(u.id, todayStr, remote);
+          } else {
+            // Offline — push local up so it's there when connection resumes
+            const local = loadItems(u.id, todayStr);
+            if (local.length > 0) syncItems(u.id, todayStr, local);
+          }
+        }));
+
       } catch(e) { console.warn("init:", e); }
       finally { setSyncing(false); }
     };
     init();
   }, []);
 
-  const addDrink = ml => {
+  const addDrink = (ml, label) => {
     const key  = `${user.id}-${today()}`;
     const prev = logs[key]||0, next = prev + ml;
     persistLogs({ ...logs, [key]:next });
     syncLog(user.id, today(), next);
+
+    // Record individual drink item
+    const items = loadItems(user.id, today());
+    items.push({ ml, time: new Date().toISOString(), emoji: drinkEmoji(ml), label: label||null });
+    saveItems(user.id, today(), items);
+    syncItems(user.id, today(), items);
+    setItemTick(t => t + 1);
 
     const dc = parseInt(localStorage.getItem(`tdd_dcount_${user.id}`) || "0") + 1;
     localStorage.setItem(`tdd_dcount_${user.id}`, String(dc));
@@ -883,7 +1091,12 @@ export default function TheDailyDrink() {
     const key  = `${user.id}-${today()}`;
     const prev = logs[key]||0;
     if (prev === 0) return;
-    const next = Math.max(0, prev - 100);
+    const items = loadItems(user.id, today());
+    const last  = items.pop();
+    saveItems(user.id, today(), items);
+    syncItems(user.id, today(), items);
+    setItemTick(t => t + 1);
+    const next = Math.max(0, prev - (last?.ml || 100));
     persistLogs({ ...logs, [key]:next });
     syncLog(user.id, today(), next);
   };
@@ -917,6 +1130,7 @@ export default function TheDailyDrink() {
     @keyframes tankWave1  { from{transform:translateX(0)} to{transform:translateX(-176px)} }
     @keyframes tankWave2  { from{transform:translateX(0)} to{transform:translateX(176px)} }
     @keyframes bubbleRise { 0%{transform:translateY(0);opacity:0.35} 100%{transform:translateY(-55px);opacity:0} }
+    @keyframes slideUp    { from{transform:translateX(-50%) translateY(100%)} to{transform:translateX(-50%) translateY(0)} }
   `;
 
   if (screen==="select") return (
@@ -1000,10 +1214,20 @@ export default function TheDailyDrink() {
         <CustomDrink color={theme.accent} light={theme.light} onAdd={addDrink}/>
       </div>
 
+      <div style={{ padding:"16px 20px 0" }} key={itemTick}>
+        <DrinkLog
+          userId={cu.id}
+          date={today()}
+          color={theme.accent}
+          dark={theme.dark}
+          onDelete={undoLast}
+        />
+      </div>
+
       <div style={{ padding:"16px 20px 0" }}>
         <div style={{ background:"white", borderRadius:24, padding:"16px 16px 12px", boxShadow:"0 4px 20px rgba(0,0,0,0.05)" }}>
-          <div style={{ fontSize:11, fontWeight:800, letterSpacing:1.5, color:"#bbb", marginBottom:12 }}>THIS WEEK</div>
-          <WeekChart userId={cu.id} goal={cu.goal} color={theme.accent} logs={logs}/>
+          <div style={{ fontSize:11, fontWeight:800, letterSpacing:1.5, color:"#bbb", marginBottom:12 }}>THIS WEEK <span style={{ fontSize:10, fontWeight:600, color:"#ccc", letterSpacing:0 }}>· tap a bar to see details</span></div>
+          <WeekChart userId={cu.id} goal={cu.goal} color={theme.accent} logs={logs} onSelectDay={setSelectedDay}/>
         </div>
       </div>
 
@@ -1029,6 +1253,18 @@ export default function TheDailyDrink() {
           <div style={{ color:"rgba(255,255,255,0.4)", fontSize:13, marginTop:24 }}>Tap to continue</div>
         </div>
       </div>}
+
+      {selectedDay && (
+        <DayHistoryPanel
+          userId={cu.id}
+          date={selectedDay}
+          goal={cu.goal}
+          color={userAColor(cu)}
+          dark={theme.dark}
+          accent={theme.accent}
+          onClose={()=>setSelectedDay(null)}
+        />
+      )}
     </div>
   );
 }
