@@ -571,23 +571,28 @@ function WeekChart({ userId, goal, color, logs, onSelectDay }) {
     return { label:d.toLocaleDateString("en-GB",{weekday:"short"}), val:logs[key]||0, isToday:i===6, date:dateStr };
   });
   return (
-    <div style={{ display:"flex", alignItems:"flex-end", gap:6, height:72, padding:"0 4px" }}>
+    <div style={{ display:"flex", alignItems:"flex-end", gap:6, height:90, padding:"0 4px" }}>
       {days.map((d,i)=>{
-        const pct=Math.min(d.val/goal,1);
+        const rawPct  = d.val / goal;
+        const visPct  = Math.min(rawPct, 1);          // capped for bar height
+        const dispPct = Math.round(rawPct * 100);     // uncapped for label
+        const over    = rawPct > 1;
         const hasDrinks = d.val > 0;
         return (
           <div key={i} onClick={()=>hasDrinks && onSelectDay(d.date)}
-            style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", gap:4, cursor:hasDrinks?"pointer":"default" }}>
-            <div style={{ width:"100%", height:44, borderRadius:8, background:"#f0f0f0", position:"relative", overflow:"hidden",
-              transition:"transform 0.1s", transform:"scale(1)" }}
+            style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", gap:3, cursor:hasDrinks?"pointer":"default" }}>
+            {/* Percentage label — only shown when there's data */}
+            <div style={{ fontSize:9, fontWeight:800, color: over?"#4CAF85": hasDrinks?color:"transparent", minHeight:12, lineHeight:"12px" }}>
+              {hasDrinks ? `${dispPct}%` : ""}
+            </div>
+            <div style={{ width:"100%", height:44, borderRadius:8, background:"#f0f0f0", position:"relative", overflow:"hidden" }}
               onMouseDown={e=>{ if(hasDrinks) e.currentTarget.style.transform="scale(0.92)"; }}
               onMouseUp={e=>e.currentTarget.style.transform="scale(1)"}
               onTouchStart={e=>{ if(hasDrinks) e.currentTarget.style.transform="scale(0.92)"; }}
               onTouchEnd={e=>e.currentTarget.style.transform="scale(1)"}>
-              <div style={{ position:"absolute", bottom:0, width:"100%", height:`${pct*100}%`, background:pct>=1?"#4CAF85":color, borderRadius:"6px 6px 0 0", transition:"height 0.4s ease" }}/>
+              <div style={{ position:"absolute", bottom:0, width:"100%", height:`${visPct*100}%`, background:over?"#4CAF85":color, borderRadius:"6px 6px 0 0", transition:"height 0.4s ease" }}/>
             </div>
             <div style={{ fontSize:10, fontWeight:d.isToday?800:600, color:d.isToday?color:"#bbb" }}>{d.label}</div>
-            {hasDrinks && <div style={{ width:4, height:4, borderRadius:"50%", background:color, opacity:0.5 }}/>}
           </div>
         );
       })}
@@ -675,29 +680,29 @@ async function fetchItemsForDate(userId, date) {
   } catch(e) { return null; }
 }
 
-function DayHistoryPanel({ userId, date, goal, color, dark, accent, onClose }) {
-  const [items, setItems]     = useState(null); // null = loading
-  const [total, setTotal]     = useState(0);
+function DayHistoryPanel({ userId, date, goal, logTotal, color, dark, accent, onClose }) {
+  const [items, setItems] = useState(null); // null = loading
 
   useEffect(()=>{
     // Try local first for instant display
     const local = loadItems(userId, date);
     setItems(local);
-    setTotal(local.reduce((s,i)=>s+i.ml, 0));
 
     // Then fetch from Sheets and replace if different
     fetchItemsForDate(userId, date).then(remote => {
       if (remote !== null) {
         saveItems(userId, date, remote);
         setItems(remote);
-        setTotal(remote.reduce((s,i)=>s+i.ml, 0));
       }
     });
   }, [userId, date]);
 
   const fmt = iso => new Date(iso).toLocaleTimeString("en-GB",{ hour:"2-digit", minute:"2-digit" });
   const friendlyDate = new Date(date + "T12:00:00").toLocaleDateString("en-GB",{ weekday:"long", day:"numeric", month:"long" });
-  const pct = Math.round((total / goal) * 100); // uncapped — shows actual %
+
+  // Always use the authoritative log total for the percentage — not the items sum,
+  // which can diverge if drinks were logged before item tracking was introduced.
+  const pct = goal > 0 ? Math.round((logTotal / goal) * 100) : 0;
 
   return (
     <>
@@ -718,7 +723,7 @@ function DayHistoryPanel({ userId, date, goal, color, dark, accent, onClose }) {
             <div>
               <div style={{ fontWeight:900, fontSize:17, color:"#333" }}>{friendlyDate}</div>
               <div style={{ fontSize:13, color:"#bbb", fontWeight:600, marginTop:2 }}>
-                {total}ml · {pct}% of goal
+                {logTotal}ml · {pct}% of goal
               </div>
             </div>
             <button onClick={onClose} style={{ background:"#f5f5f5", border:"none", borderRadius:"50%", width:32, height:32, fontSize:16, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", color:"#999" }}>✕</button>
@@ -1050,6 +1055,30 @@ export default function TheDailyDrink() {
     init();
   }, []);
 
+  // ── Android back button handler ───────────────────────────────────────────
+  // Push a history entry whenever we navigate away from "select" so the
+  // browser's back gesture/button returns to select rather than exiting the app.
+  useEffect(()=>{
+    if (screen === "select") {
+      // Replace so there's always a clean base entry
+      history.replaceState({ screen:"select" }, "");
+    } else {
+      history.pushState({ screen }, "");
+    }
+  }, [screen]);
+
+  useEffect(()=>{
+    const onPop = (e) => {
+      // Always go back to select, regardless of which screen we're on
+      setScreen("select");
+      setSelectedDay(null);
+      // Re-push so the next back press is also caught
+      history.pushState({ screen:"select" }, "");
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+
   const addDrink = (ml, label) => {
     const key  = `${user.id}-${today()}`;
     const prev = logs[key]||0, next = prev + ml;
@@ -1260,6 +1289,7 @@ export default function TheDailyDrink() {
           userId={cu.id}
           date={selectedDay}
           goal={cu.goal}
+          logTotal={logs[`${cu.id}-${selectedDay}`] || 0}
           color={userAColor(cu)}
           dark={theme.dark}
           accent={theme.accent}
