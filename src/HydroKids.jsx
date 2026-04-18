@@ -576,7 +576,7 @@ function WeekChart({ userId, goal, color, logs, onSelectDay }) {
         const rawPct  = d.val / goal;
         const visPct  = Math.min(rawPct, 1);          // capped for bar height
         const dispPct = Math.round(rawPct * 100);     // uncapped for label
-        const over    = rawPct > 1;
+        const over    = rawPct >= 1;
         const hasDrinks = d.val > 0;
         return (
           <div key={i} onClick={()=>hasDrinks && onSelectDay(d.date)}
