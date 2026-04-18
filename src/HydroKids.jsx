@@ -697,7 +697,7 @@ function DayHistoryPanel({ userId, date, goal, color, dark, accent, onClose }) {
 
   const fmt = iso => new Date(iso).toLocaleTimeString("en-GB",{ hour:"2-digit", minute:"2-digit" });
   const friendlyDate = new Date(date + "T12:00:00").toLocaleDateString("en-GB",{ weekday:"long", day:"numeric", month:"long" });
-  const pct = Math.round(Math.min(total / goal, 1) * 100);
+  const pct = Math.round((total / goal) * 100); // uncapped — shows actual %
 
   return (
     <>
@@ -725,7 +725,7 @@ function DayHistoryPanel({ userId, date, goal, color, dark, accent, onClose }) {
           </div>
           {/* Mini progress bar */}
           <div style={{ height:6, background:"#f0f0f0", borderRadius:3, marginTop:12, overflow:"hidden" }}>
-            <div style={{ height:6, borderRadius:3, background:pct>=100?"#4CAF85":accent, width:`${pct}%`, transition:"width 0.4s ease" }}/>
+            <div style={{ height:6, borderRadius:3, background:pct>=100?"#4CAF85":accent, width:`${Math.min(pct,100)}%`, transition:"width 0.4s ease" }}/>
           </div>
         </div>
 
@@ -936,8 +936,9 @@ function SelectScreen({ users, logs, onSelect, onSettings }) {
         {users.map((u,idx)=>{
           const theme=userTheme(u), aColor=userAColor(u);
           const intake=logs[`${u.id}-${today()}`]||0;
-          const pct=Math.min(intake/u.goal,1);
-          const pctRound=Math.round(pct*100);
+          const rawPct = intake/u.goal;
+          const visPct = Math.min(rawPct, 1);           // capped — for bar width only
+          const pctDisplay = Math.round(rawPct * 100);  // uncapped — shown as number
           const animalInfo=ANIMALS.find(a=>a.id===(u.animal||"cat"));
           const badges=loadBadges(u.id);
           const badgeCount=Object.keys(badges).length;
@@ -962,14 +963,14 @@ function SelectScreen({ users, logs, onSelect, onSettings }) {
                     )}
                   </div>
                   <div style={{ height:8, background:"rgba(255,255,255,0.12)", borderRadius:4, marginBottom:8, overflow:"hidden" }}>
-                    <div style={{ height:8, borderRadius:4, background:pct>=1?"#4CAF85":theme.accent, width:`${pctRound}%`, transition:"width 0.5s ease", boxShadow:`0 0 8px ${pct>=1?"#4CAF8588":theme.accent+"88"}` }}/>
+                    <div style={{ height:8, borderRadius:4, background:visPct>=1?"#4CAF85":theme.accent, width:`${visPct*100}%`, transition:"width 0.5s ease", boxShadow:`0 0 8px ${visPct>=1?"#4CAF8588":theme.accent+"88"}` }}/>
                   </div>
                   <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
                     <div style={{ fontSize:13, color:"rgba(255,255,255,0.45)", fontWeight:700 }}>
                       {intake}ml <span style={{ opacity:0.5 }}>/ {u.goal}ml</span>
                     </div>
-                    <div style={{ background:pct>=1?"#4CAF85":theme.accent, borderRadius:12, padding:"4px 14px", fontWeight:900, fontSize:15, color:"white", boxShadow:`0 2px 8px ${pct>=1?"#4CAF8566":theme.accent+"66"}` }}>
-                      {pctRound}%
+                    <div style={{ background:visPct>=1?"#4CAF85":theme.accent, borderRadius:12, padding:"4px 14px", fontWeight:900, fontSize:15, color:"white", boxShadow:`0 2px 8px ${visPct>=1?"#4CAF8566":theme.accent+"66"}` }}>
+                      {pctDisplay}%
                     </div>
                   </div>
                 </div>
