@@ -60,64 +60,56 @@ async function syncItems(userId, date, items) {
   } catch(e) { console.warn("syncItems:", e); }
 }
 
-// Fetch today's items from Sheets and replace local — Sheets is source of truth
+// Fetch today's items for a specific past date (used by DayHistoryPanel)
 async function fetchAndReplaceItems(userId, date) {
   if (!APPS_SCRIPT_URL) return null;
   try {
     const res = await fetch(APPS_SCRIPT_URL + `?action=items&userId=${userId}&date=${date}`);
     const j   = await res.json();
     if (j.status !== "ok") return null;
-    return j.data.items; // array of { ml, time, emoji, label }
+    return j.data.items;
   } catch(e) { return null; }
 }
 
-async function fetchAndMergeLogs(local) {
-  if (!APPS_SCRIPT_URL) return local;
+// ── Single bulk fetch — replaces all individual load-time fetches ─────────────
+// One request returns: logs, profiles, badges, and today's items for all users.
+// Reduces cold-start penalty from 5-6 round trips (~10s) to 1 (~1-2s).
+async function bulkFetch(localUsers, localLogs, todayStr) {
+  if (!APPS_SCRIPT_URL) return null;
   try {
-    const res = await fetch(APPS_SCRIPT_URL + "?action=fetch");
+    const res = await fetch(APPS_SCRIPT_URL + `?action=bulk&today=${todayStr}`);
     const j   = await res.json();
-    if (j.status !== "ok") return local;
-    return { ...local, ...j.data.logs };
-  } catch(e) { return local; }
-}
+    if (j.status !== "ok") return null;
+    const { logs, profiles, badges, todayItems } = j.data;
 
-async function fetchAndMergeProfiles(localUsers) {
-  if (!APPS_SCRIPT_URL) return localUsers;
-  try {
-    const res = await fetch(APPS_SCRIPT_URL + "?action=profiles");
-    const j   = await res.json();
-    if (j.status !== "ok") return localUsers;
-    return localUsers.map(u => {
-      const r = j.data.profiles.find(p => p.userId === u.id);
+    // Merge logs — remote wins
+    const mergedLogs = { ...localLogs, ...logs };
+
+    // Merge profiles — remote wins per field
+    const mergedUsers = localUsers.map(u => {
+      const r = profiles.find(p => p.userId === u.id);
       if (!r) return u;
-      return { ...u, name:r.name||u.name, goal:r.goal||u.goal, animal:r.animal||u.animal, themeId:r.themeId||u.themeId, animalColorId:r.animalColorId||u.animalColorId };
+      return { ...u,
+        name:         r.name          || u.name,
+        goal:         r.goal          || u.goal,
+        animal:       r.animal        || u.animal,
+        themeId:      r.themeId       || u.themeId,
+        animalColorId:r.animalColorId || u.animalColorId,
+      };
     });
-  } catch(e) { return localUsers; }
-}
 
-// Sync strategy for badges:
-// 1. Push every local badge up to Sheets (so nothing earned offline is lost)
-// 2. Fetch the full badge state from Sheets
-// 3. Use Sheets as the single source of truth — replace local entirely
-// Fallback: if the fetch fails (offline), keep local unchanged.
-async function pushThenFetchBadges(localBadges, userId) {
-  if (!APPS_SCRIPT_URL) return localBadges;
-  try {
-    // Step 1 — push all local badges up to Sheets in parallel (fire-and-forget)
-    await Promise.all(
-      Object.entries(localBadges).map(([id, b]) =>
-        syncBadge(userId, id, b.count || 1, b.first || b, b.last || b)
-      )
-    );
-    // Step 2 — fetch the authoritative state from Sheets
-    const res = await fetch(APPS_SCRIPT_URL + `?action=badges&userId=${userId}`);
-    const j   = await res.json();
-    if (j.status !== "ok") return localBadges;
-    // Step 3 — Sheets wins completely; return remote as the new local state
-    return j.data.badges; // { badgeId: { count, first, last } }
+    // Badges — remote is authoritative per user (after local push)
+    const mergedBadges = badges; // { userId: { badgeId: { count, first, last } } }
+
+    // Today's items — remote wins per user
+    const mergedItems = todayItems; // { userId: [...] }
+
+    return { mergedLogs, mergedUsers, mergedBadges, mergedItems };
   } catch(e) {
-    return localBadges; // offline — keep local, will re-sync next open
+    console.warn("bulkFetch failed (offline?):", e);
+    return null;
   }
+}
 }
 
 // ── Drink item log (localStorage only, per user per day) ─────────────────────
@@ -1016,38 +1008,53 @@ export default function TheDailyDrink() {
         const su = localStorage.getItem("hydrokids_users");
         let localLogs  = sl ? JSON.parse(sl) : {};
         let localUsers = su ? JSON.parse(su) : DEFAULT_USERS;
+
+        // Show local data instantly — no waiting for network
         setLogs(localLogs);
         setUsers(localUsers);
         setSyncing(true);
 
-        // Sync logs, profiles, and badges for all users in parallel
-        const [mLogs, mUsers] = await Promise.all([
-          fetchAndMergeLogs(localLogs),
-          fetchAndMergeProfiles(localUsers),
-        ]);
-        persistLogs(mLogs);
-        persistUsers(mUsers);
-        syncAll(mLogs);
-
-        // Badge sync: push local up first, then use Sheets as truth
-        await Promise.all(DEFAULT_USERS.map(async u => {
-          const local      = loadBadges(u.id);
-          const authoritative = await pushThenFetchBadges(local, u.id);
-          saveBadgesLocal(u.id, authoritative);
-        }));
-
-        // Item sync: fetch today's items from Sheets — Sheets wins
         const todayStr = today();
-        await Promise.all(DEFAULT_USERS.map(async u => {
-          const remote = await fetchAndReplaceItems(u.id, todayStr);
-          if (remote !== null) {
-            saveItems(u.id, todayStr, remote);
-          } else {
-            // Offline — push local up so it's there when connection resumes
-            const local = loadItems(u.id, todayStr);
-            if (local.length > 0) syncItems(u.id, todayStr, local);
-          }
-        }));
+
+        // ── Step 1: push local badges up first (offline-earned badges preserved) ──
+        // Fire-and-forget in parallel — doesn't block the bulk fetch
+        DEFAULT_USERS.forEach(u => {
+          const local = loadBadges(u.id);
+          Object.entries(local).forEach(([id, b]) =>
+            syncBadge(u.id, id, b.count||1, b.first||b, b.last||b)
+          );
+        });
+
+        // ── Step 2: single bulk fetch — 1 round trip instead of 5-6 ─────────────
+        const bulk = await bulkFetch(localUsers, localLogs, todayStr);
+
+        if (bulk) {
+          const { mergedLogs, mergedUsers, mergedBadges, mergedItems } = bulk;
+
+          persistLogs(mergedLogs);
+          persistUsers(mergedUsers);
+
+          // Apply badges per user — Sheets is authoritative
+          DEFAULT_USERS.forEach(u => {
+            if (mergedBadges[u.id]) saveBadgesLocal(u.id, mergedBadges[u.id]);
+          });
+
+          // Apply today's items per user — Sheets is authoritative
+          DEFAULT_USERS.forEach(u => {
+            if (mergedItems[u.id] !== undefined) {
+              saveItems(u.id, todayStr, mergedItems[u.id]);
+            } else {
+              // Not on Sheets yet — push local up
+              const local = loadItems(u.id, todayStr);
+              if (local.length > 0) syncItems(u.id, todayStr, local);
+            }
+          });
+
+          // Push full log state up to Sheets (catches any offline drinks)
+          syncAll(mergedLogs);
+
+          setItemTick(t => t + 1); // refresh DrinkLog display
+        }
 
       } catch(e) { console.warn("init:", e); }
       finally { setSyncing(false); }
