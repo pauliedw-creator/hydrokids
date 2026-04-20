@@ -82,8 +82,15 @@ async function bulkFetch(localUsers, localLogs, todayStr) {
     if (j.status !== "ok") return null;
     const { logs, profiles, badges, todayItems } = j.data;
 
-    // Merge logs — remote wins
-    const mergedLogs = { ...localLogs, ...logs };
+    // Merge logs — take the higher value per key.
+    // Remote wins for past days (local may be missing them).
+    // Local wins for today if Sheets hasn't received the latest drink tap yet
+    // (no-cors fire-and-forget writes can lag behind the bulk fetch).
+    const mergedLogs = { ...localLogs };
+    Object.entries(logs).forEach(([key, remoteVal]) => {
+      const localVal = mergedLogs[key] || 0;
+      mergedLogs[key] = Math.max(localVal, remoteVal);
+    });
 
     // Merge profiles — remote wins per field
     const mergedUsers = localUsers.map(u => {
@@ -109,7 +116,6 @@ async function bulkFetch(localUsers, localLogs, todayStr) {
     console.warn("bulkFetch failed (offline?):", e);
     return null;
   }
-}
 }
 
 // ── Drink item log (localStorage only, per user per day) ─────────────────────
@@ -619,7 +625,7 @@ function SectionCard({ title, hint, children }) {
 }
 
 // ── Drink log ─────────────────────────────────────────────────────────────────
-function DrinkLog({ userId, date, color, dark, onDelete }) {
+function DrinkLog({ userId, date, color, dark, logTotal, onDelete }) {
   const items = loadItems(userId, date);
   if (items.length === 0) return (
     <div style={{ background:"white", borderRadius:24, padding:"16px 18px", boxShadow:"0 4px 20px rgba(0,0,0,0.05)" }}>
@@ -638,7 +644,7 @@ function DrinkLog({ userId, date, color, dark, onDelete }) {
       <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:12 }}>
         <div style={{ fontSize:11, fontWeight:800, letterSpacing:1.5, color:"#bbb" }}>TODAY'S DRINKS</div>
         <div style={{ fontSize:11, fontWeight:800, color:color }}>
-          {items.reduce((s,i)=>s+i.ml,0)}ml total
+          {logTotal}ml total
         </div>
       </div>
       <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
@@ -1257,6 +1263,7 @@ export default function TheDailyDrink() {
           date={today()}
           color={theme.accent}
           dark={theme.dark}
+          logTotal={intake}
           onDelete={undoLast}
         />
       </div>
