@@ -1015,52 +1015,59 @@ export default function TheDailyDrink() {
         let localLogs  = sl ? JSON.parse(sl) : {};
         let localUsers = su ? JSON.parse(su) : DEFAULT_USERS;
 
-        // Show local data instantly — no waiting for network
+        // Show local data instantly
         setLogs(localLogs);
         setUsers(localUsers);
         setSyncing(true);
 
         const todayStr = today();
 
-        // ── Step 1: push local badges up first (offline-earned badges preserved) ──
-        // Fire-and-forget in parallel — doesn't block the bulk fetch
+        // ── Single bulk fetch — 1 round trip ─────────────────────────────────
+        const bulk = await bulkFetch(localUsers, localLogs, todayStr);
+
+        if (bulk) {
+          const { mergedLogs, mergedUsers, mergedBadges, mergedItems } = bulk;
+
+          // Apply today's items first — items are source of truth
+          DEFAULT_USERS.forEach(u => {
+            if (mergedItems[u.id] !== undefined) {
+              saveItems(u.id, todayStr, mergedItems[u.id]);
+              // Recompute today's log total from items so they always match
+              const computedTotal = mergedItems[u.id].reduce((s,i) => s + i.ml, 0);
+              if (computedTotal > 0) {
+                mergedLogs[`${u.id}-${todayStr}`] = Math.max(
+                  mergedLogs[`${u.id}-${todayStr}`] || 0,
+                  computedTotal
+                );
+              }
+            } else {
+              // No items on Sheets yet — push local up
+              const local = loadItems(u.id, todayStr);
+              if (local.length > 0) syncItems(u.id, todayStr, local);
+            }
+          });
+
+          persistLogs(mergedLogs);
+          persistUsers(mergedUsers);
+
+          // Apply badges
+          DEFAULT_USERS.forEach(u => {
+            if (mergedBadges[u.id]) saveBadgesLocal(u.id, mergedBadges[u.id]);
+          });
+
+          // Push full log state up (catches any offline drinks)
+          syncAll(mergedLogs);
+
+          setItemTick(t => t + 1);
+        }
+
+        // ── Badge push — fire-and-forget AFTER bulk fetch, doesn't block ──────
         DEFAULT_USERS.forEach(u => {
           const local = loadBadges(u.id);
           Object.entries(local).forEach(([id, b]) =>
             syncBadge(u.id, id, b.count||1, b.first||b, b.last||b)
           );
         });
-
-        // ── Step 2: single bulk fetch — 1 round trip instead of 5-6 ─────────────
-        const bulk = await bulkFetch(localUsers, localLogs, todayStr);
-
-        if (bulk) {
-          const { mergedLogs, mergedUsers, mergedBadges, mergedItems } = bulk;
-
-          persistLogs(mergedLogs);
-          persistUsers(mergedUsers);
-
-          // Apply badges per user — Sheets is authoritative
-          DEFAULT_USERS.forEach(u => {
-            if (mergedBadges[u.id]) saveBadgesLocal(u.id, mergedBadges[u.id]);
-          });
-
-          // Apply today's items per user — Sheets is authoritative
-          DEFAULT_USERS.forEach(u => {
-            if (mergedItems[u.id] !== undefined) {
-              saveItems(u.id, todayStr, mergedItems[u.id]);
-            } else {
-              // Not on Sheets yet — push local up
-              const local = loadItems(u.id, todayStr);
-              if (local.length > 0) syncItems(u.id, todayStr, local);
-            }
-          });
-
-          // Push full log state up to Sheets (catches any offline drinks)
-          syncAll(mergedLogs);
-
-          setItemTick(t => t + 1); // refresh DrinkLog display
-        }
 
       } catch(e) { console.warn("init:", e); }
       finally { setSyncing(false); }
@@ -1093,15 +1100,17 @@ export default function TheDailyDrink() {
   }, []);
 
   const addDrink = (ml, label) => {
-    const key  = `${user.id}-${today()}`;
-    const prev = logs[key]||0, next = prev + ml;
-    persistLogs({ ...logs, [key]:next });
-    syncLog(user.id, today(), next);
+    const key   = `${user.id}-${today()}`;
+    const prev  = logs[key] || 0;
 
-    // Record individual drink item
+    // Items are the single source of truth — total is always derived from their sum
     const items = loadItems(user.id, today());
     items.push({ ml, time: new Date().toISOString(), emoji: drinkEmoji(ml), label: label||null });
     saveItems(user.id, today(), items);
+    const next = items.reduce((s,i) => s + i.ml, 0);
+
+    persistLogs({ ...logs, [key]: next });
+    syncLog(user.id, today(), next);
     syncItems(user.id, today(), items);
     setItemTick(t => t + 1);
 
@@ -1131,17 +1140,16 @@ export default function TheDailyDrink() {
   };
 
   const undoLast = () => {
-    const key  = `${user.id}-${today()}`;
-    const prev = logs[key]||0;
-    if (prev === 0) return;
     const items = loadItems(user.id, today());
-    const last  = items.pop();
+    if (items.length === 0) return;
+    items.pop();
     saveItems(user.id, today(), items);
+    const next = items.reduce((s,i) => s + i.ml, 0);
+    const key  = `${user.id}-${today()}`;
+    persistLogs({ ...logs, [key]: next });
+    syncLog(user.id, today(), next);
     syncItems(user.id, today(), items);
     setItemTick(t => t + 1);
-    const next = Math.max(0, prev - (last?.ml || 100));
-    persistLogs({ ...logs, [key]:next });
-    syncLog(user.id, today(), next);
   };
 
   const getStreak = (userId, goalAmt) => {
