@@ -92,16 +92,22 @@ async function bulkFetch(localUsers, localLogs, todayStr) {
       mergedLogs[key] = Math.max(localVal, remoteVal);
     });
 
-    // Merge profiles — remote wins per field
+    // Merge profiles — local wins over remote.
+    // Profile changes are written via no-cors fire-and-forget, so Sheets may
+    // still have a stale value when the bulk fetch runs. The user's local change
+    // is always more recent than whatever Sheets has at this moment.
+    // Remote only fills in fields that are completely missing from local (new installs).
     const mergedUsers = localUsers.map(u => {
       const r = profiles.find(p => p.userId === u.id);
       if (!r) return u;
-      return { ...u,
-        name:         r.name          || u.name,
-        goal:         r.goal          || u.goal,
-        animal:       r.animal        || u.animal,
-        themeId:      r.themeId       || u.themeId,
-        animalColorId:r.animalColorId || u.animalColorId,
+      return {
+        ...u,
+        // Local wins on every field — only fall back to remote if local is empty/zero
+        name:          u.name          || r.name,
+        goal:          u.goal          || r.goal,
+        animal:        u.animal        || r.animal,
+        themeId:       u.themeId       || r.themeId,
+        animalColorId: u.animalColorId || r.animalColorId,
       };
     });
 
