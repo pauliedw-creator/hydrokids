@@ -92,23 +92,30 @@ async function bulkFetch(localUsers, localLogs, todayStr) {
       mergedLogs[key] = Math.max(localVal, remoteVal);
     });
 
-    // Merge profiles — local wins over remote.
-    // Profile changes are written via no-cors fire-and-forget, so Sheets may
-    // still have a stale value when the bulk fetch runs. The user's local change
-    // is always more recent than whatever Sheets has at this moment.
-    // Remote only fills in fields that are completely missing from local (new installs).
+    // Merge profiles — newest write wins, determined by updatedAt timestamp.
+    // This correctly handles cross-device sync: if Device A saved new settings,
+    // its profile on Sheets will have a later updatedAt than Device B's local copy,
+    // so Sheets wins on Device B. If the user just saved on this device and the
+    // no-cors write hasn't landed yet, local updatedAt will be newer, so local wins.
     const mergedUsers = localUsers.map(u => {
       const r = profiles.find(p => p.userId === u.id);
       if (!r) return u;
-      return {
-        ...u,
-        // Local wins on every field — only fall back to remote if local is empty/zero
-        name:          u.name          || r.name,
-        goal:          u.goal          || r.goal,
-        animal:        u.animal        || r.animal,
-        themeId:       u.themeId       || r.themeId,
-        animalColorId: u.animalColorId || r.animalColorId,
-      };
+      const localTime  = new Date(u.updatedAt  || 0).getTime();
+      const remoteTime = new Date(r.updatedAt  || 0).getTime();
+      // Remote is newer — use it
+      if (remoteTime > localTime) {
+        return {
+          ...u,
+          name:          r.name          || u.name,
+          goal:          r.goal          || u.goal,
+          animal:        r.animal        || u.animal,
+          themeId:       r.themeId       || u.themeId,
+          animalColorId: r.animalColorId || u.animalColorId,
+          updatedAt:     r.updatedAt,
+        };
+      }
+      // Local is newer or equal — keep it (covers: just saved, no-cors not landed yet)
+      return u;
     });
 
     // Badges — remote is authoritative per user (after local push)
@@ -1051,6 +1058,15 @@ export default function TheDailyDrink() {
               const local = loadItems(u.id, todayStr);
               if (local.length > 0) syncItems(u.id, todayStr, local);
             }
+
+            // Push local items for last 7 days that aren't yet on Sheets —
+            // ensures history panel is consistent across devices
+            for (let i = 1; i <= 6; i++) {
+              const d = new Date(); d.setDate(d.getDate() - i);
+              const dateStr = d.toISOString().split("T")[0];
+              const local   = loadItems(u.id, dateStr);
+              if (local.length > 0) syncItems(u.id, dateStr, local);
+            }
           });
 
           persistLogs(mergedLogs);
@@ -1169,9 +1185,11 @@ export default function TheDailyDrink() {
   };
 
   const saveSettings = updated => {
-    persistUsers(users.map(u=>u.id===updated.id?updated:u));
-    setUser(updated);
-    syncProfile(updated);
+    // Stamp updatedAt so timestamp-based merge knows this is the newest version
+    const stamped = { ...updated, updatedAt: new Date().toISOString() };
+    persistUsers(users.map(u => u.id === stamped.id ? stamped : u));
+    setUser(stamped);
+    syncProfile(stamped);
     setScreen("main");
   };
 
